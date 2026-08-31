@@ -7,6 +7,12 @@
 ```zig 
 zig build run
 ```
+4. Verify by opening a new terminal and typing the following: 
+```terminal 
+where.exe zig
+zig version
+```
+- shows where zig is installed on windows + what version zig is installed
 
 ## Core (first pass)
 1. Comptime platform detection:
