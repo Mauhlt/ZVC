@@ -255,7 +255,7 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map) !voi
     defer gpa.free(zig_bin_rel);
 
     const zig_bin = try cwd.realPathFileAlloc(io, zig_bin_rel, gpa);
-    defer gpa.free(zig_bin_rel);
+    defer gpa.free(zig_bin);
     std.debug.print("Candidate Compiler: {s}\n", .{zig_bin});
 
     candidate_ok = try validateAgainstTestProjects(io, zig_bin);
@@ -498,11 +498,35 @@ fn ensureArchiveDownloaded(
     std.log.info("Downloaded {s} (sha256 verified)", .{archive_name});
 }
 
+/// True if `path_or_child` is `ancestor` itself, or a path underneath it.
+/// Used to check whether a resolved "live" directory lives inside a
+/// candidate version directory, regardless of how deeply nested (e.g. a
+/// version dir `versions/0.16.0` whose actual zig home is the nested
+/// `versions/0.16.0/zig-x86_64-windows-0.16.0`).
+fn pathIsWithin(ancestor: []const u8, path_or_child: []const u8) bool {
+    if (!std.mem.startsWith(u8, path_or_child, ancestor)) return false;
+    if (path_or_child.len == ancestor.len) return true;
+    const sep = path_or_child[ancestor.len];
+    return sep == '/' or sep == '\\';
+}
+
+/// Resolves the real, canonical directory that the configured "live" zig
+/// (see `live-path.txt`) currently points at, if any. Best-effort: any
+/// failure (nothing configured yet, dangling junction, etc.) just yields
+/// `null` rather than an error, since this is only used to decide what
+/// pruning must not touch.
+fn currentLiveRealPath(gpa: Allocator, io: Io, zvc_dir: Dir) ?[:0]u8 {
+    const live_dir_path = (loadLiveDirConfig(gpa, io, zvc_dir) catch null) orelse return null;
+    defer gpa.free(live_dir_path);
+    return Dir.cwd().realPathFileAlloc(io, live_dir_path, gpa) catch null;
+}
+
 fn pruneVersions(
     gpa: Allocator,
     io: Io,
     versions_dir: Dir,
     keep_name: ?[]const u8,
+    live_real_path: ?[]const u8,
 ) !void {
     var to_delete: std.ArrayList([]u8) = .empty;
     defer {
@@ -515,6 +539,22 @@ fn pruneVersions(
         if (entry.kind != .directory) continue;
         if (keep_name) |keep| {
             if (std.mem.eql(u8, entry.name, keep)) continue;
+        }
+        // Never delete whatever directory currently backs the live zig
+        // install, even if it isn't the recorded "active" version (the two
+        // can drift, e.g. after a failed promotion). Deleting it out from
+        // under a running/linked compiler is what corrupts installs.
+        if (live_real_path) |live_real| protect: {
+            const candidate_real = versions_dir.realPathFileAlloc(io, entry.name, gpa) catch
+                break :protect;
+            defer gpa.free(candidate_real);
+            if (pathIsWithin(candidate_real, live_real)) {
+                std.log.info(
+                    "Keeping {s}: currently backs the live zig install.",
+                    .{entry.name},
+                );
+                continue;
+            }
         }
         try to_delete.append(gpa, try gpa.dupe(u8, entry.name));
     }
@@ -544,8 +584,11 @@ fn prepareVersion(
     const archive_name = std.fs.path.basenamePosix(release.tarball);
     try ensureArchiveDownloaded(io, client, downloads_dir, release, archive_name);
 
+    const live_real_path = currentLiveRealPath(gpa, io, zvc_dir);
+    defer if (live_real_path) |p| gpa.free(p);
+
     var versions_dir = try zvc_dir.openDir(io, versions_subdir, .{ .iterate = true });
-    try pruneVersions(gpa, io, versions_dir, keep_alongside);
+    try pruneVersions(gpa, io, versions_dir, keep_alongside, live_real_path);
     versions_dir.close(io);
 
     const version_rel = try std.fs.path.join(gpa, &.{ versions_subdir, release.name });
@@ -831,7 +874,10 @@ fn createLink(io: Io, link_path: []const u8, target_path: []const u8) !void {
                 .stderr = .ignore,
             });
             const term = try child.wait(io);
-            if (!term.success()) return error.JunctionCreateFailed;
+            switch (term) {
+                .exited => |code| if (code != 0) return error.JunctionCreateFailed,
+                else => return error.JunctionCreateFailed,
+            }
         },
         else => try Dir.cwd().symLink(
             io,
@@ -949,6 +995,7 @@ fn syncLiveInstall(
             return;
         };
         std.log.info("Live zig at {s} now points to {s}.", .{ live_dir, candidate_name });
+        return;
     }
     std.log.info(
         "Nightly {s} failed its tests; looking for a fallback for {s}...\n",

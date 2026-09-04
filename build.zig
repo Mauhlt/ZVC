@@ -17,7 +17,15 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    run_cmd.addPassthruArgs();
+    // This project manages its own "live" zig version on PATH (see README),
+    // so the zig version used to build it can change between runs. Support
+    // both the newer `addPassthruArgs` API and the older `b.args` one so
+    // `zig build run` keeps working regardless of which is active.
+    if (@hasDecl(@TypeOf(run_cmd.*), "addPassthruArgs")) {
+        run_cmd.addPassthruArgs();
+    } else if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
