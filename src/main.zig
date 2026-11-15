@@ -383,11 +383,16 @@ fn fetchBytes(gpa: Allocator, client: *std.http.Client, url: []const u8) ![]u8 {
 }
 
 const LatestRelease = struct {
+    /// Always a `parseVersion`-checked version: it becomes a folder name and
+    /// the content of active-version.txt.
     name: []const u8,
     tarball: []const u8,
-    /// null for a build found outside the index (an older dev build): its
-    /// minisign signature is checked instead.
+    /// The index's sha256 (lowercase hex), checked in addition to the
+    /// minisign signature; null for a build found outside the index (an older
+    /// dev build), which has only the signature.
     sha_sum: ?[]const u8,
+    /// The archive size the index declares, if any; caps the download.
+    size: ?u64 = null,
 
     pub fn initFromValue(gpa: Allocator, root: std.json.Value) !@This() {
         return switch (channel) {
@@ -402,23 +407,40 @@ const LatestRelease = struct {
         if (self.sha_sum) |sum| gpa.free(sum);
     }
 
+    /// Reads one target's entry. Every field is type-checked, so an index of
+    /// an unexpected shape is an error, never a panic.
     pub fn initFromObjectMap(
         gpa: Allocator,
         name: []const u8,
         target_obj: std.json.ObjectMap,
     ) !@This() {
-        const tarball = (target_obj.get("tarball") orelse //
-            return error.MissingTarballField).string;
-        const sha_sum = (target_obj.get("shasum") orelse //
-            return error.MissingShasumField).string;
+        const version = try parseVersion(name);
+        const tarball = target_obj.get("tarball") orelse return error.MissingTarballField;
+        if (tarball != .string or !std.mem.startsWith(u8, tarball.string, "https://"))
+            return error.BadIndex;
+        const sha_sum = target_obj.get("shasum") orelse return error.MissingShasumField;
+        if (sha_sum != .string or !isSha256Hex(sha_sum.string)) return error.BadIndex;
+        const size: ?u64 = if (target_obj.get("size")) |value| switch (value) {
+            .string => |text| std.fmt.parseUnsigned(u64, text, 10) catch return error.BadIndex,
+            .integer => |n| std.math.cast(u64, n) orelse return error.BadIndex,
+            else => return error.BadIndex,
+        } else null;
+
+        const name_copy = try gpa.dupe(u8, version);
+        errdefer gpa.free(name_copy);
+        const tarball_copy = try gpa.dupe(u8, tarball.string);
+        errdefer gpa.free(tarball_copy);
+        const sha_copy = try std.ascii.allocLowerString(gpa, sha_sum.string);
         return .{
-            .name = try gpa.dupe(u8, name),
-            .tarball = try gpa.dupe(u8, tarball),
-            .sha_sum = try gpa.dupe(u8, sha_sum),
+            .name = name_copy,
+            .tarball = tarball_copy,
+            .sha_sum = sha_copy,
+            .size = size,
         };
     }
 
     pub fn findLatestStable(gpa: Allocator, root: std.json.Value) !@This() {
+        if (root != .object) return error.BadIndex;
         var best: ?std.SemanticVersion = null;
         var best_key: []const u8 = "";
 
@@ -426,7 +448,8 @@ const LatestRelease = struct {
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             if (std.mem.eql(u8, key, "master")) continue;
-            const ver = std.SemanticVersion.parse(key) catch continue;
+            const checked = parseVersion(key) catch continue;
+            const ver = std.SemanticVersion.parse(checked) catch continue;
             if (best == null or ver.order(best.?) == .gt) {
                 best = ver;
                 best_key = key;
@@ -434,22 +457,32 @@ const LatestRelease = struct {
         }
         if (best == null) return error.NoStableVersionFound;
 
-        const release_obj = root.object.get(best_key).?.object;
-        const target_obj = (release_obj.get(target_info.triple) orelse
-            return error.NoBuildForThisTarget).object;
-        return initFromObjectMap(gpa, best_key, target_obj);
+        const release_obj = root.object.get(best_key).?;
+        if (release_obj != .object) return error.BadIndex;
+        const target_obj = release_obj.object.get(target_info.triple) orelse
+            return error.NoBuildForThisTarget;
+        if (target_obj != .object) return error.BadIndex;
+        return initFromObjectMap(gpa, best_key, target_obj.object);
     }
 
     pub fn findMaster(gpa: Allocator, root: std.json.Value) !@This() {
-        const master_obj = (root.object.get("master") orelse //
-            return error.NoMasterEntry).object;
-        const name = (master_obj.get("version") orelse //
-            return error.MissingVersionField).string;
-        const target_obj = (master_obj.get(target_info.triple) orelse
-            return error.NoBuildForThisTarget).object;
-        return initFromObjectMap(gpa, name, target_obj);
+        if (root != .object) return error.BadIndex;
+        const master_obj = root.object.get("master") orelse return error.NoMasterEntry;
+        if (master_obj != .object) return error.BadIndex;
+        const name = master_obj.object.get("version") orelse return error.MissingVersionField;
+        if (name != .string) return error.BadIndex;
+        const target_obj = master_obj.object.get(target_info.triple) orelse
+            return error.NoBuildForThisTarget;
+        if (target_obj != .object) return error.BadIndex;
+        return initFromObjectMap(gpa, name.string, target_obj.object);
     }
 };
+
+fn isSha256Hex(text: []const u8) bool {
+    if (text.len != 64) return false;
+    for (text) |ch| if (!std.ascii.isHex(ch)) return false;
+    return true;
+}
 
 fn isNightlyVersionName(name: []const u8) bool {
     return std.mem.indexOf(u8, name, "-dev") != null;
@@ -1960,6 +1993,9 @@ test "this build's target names its archive the way ziglang.org does" {
     try std.testing.expectEqualStrings(expected, name);
 }
 
+const test_sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const test_sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 test "findInIndex: releases by key, the newest dev build via master, older dev builds absent" {
     const gpa = std.testing.allocator;
     const index =
@@ -1968,13 +2004,18 @@ test "findInIndex: releases by key, the newest dev build via master, older dev b
         \\    "version": "0.18.0-dev.1124+2ecf4b5e2",
         \\    "x86_64-windows": {
         \\      "tarball": "https://ziglang.org/builds/zig-x86_64-windows-0.18.0-dev.1124+2ecf4b5e2.zip",
-        \\      "shasum": "aa"
+        \\      "shasum": "
+    ++ test_sha_a ++
+        \\",
+        \\      "size": "92937573"
         \\    }
         \\  },
         \\  "0.16.0": {
         \\    "x86_64-windows": {
         \\      "tarball": "https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip",
-        \\      "shasum": "bb"
+        \\      "shasum": "
+    ++ test_sha_b ++
+        \\"
         \\    }
         \\  }
         \\}
@@ -1984,18 +2025,110 @@ test "findInIndex: releases by key, the newest dev build via master, older dev b
 
     const release = (try findInIndex(gpa, parsed.value, "x86_64-windows", "0.16.0")).?;
     defer release.deinit(gpa);
-    try std.testing.expectEqualStrings("bb", release.sha_sum.?);
+    try std.testing.expectEqualStrings(test_sha_b, release.sha_sum.?);
+    try std.testing.expectEqual(null, release.size);
 
     const master = (try findInIndex(gpa, parsed.value, "x86_64-windows", "0.18.0-dev.1124+2ecf4b5e2")).?;
     defer master.deinit(gpa);
     try std.testing.expectEqualStrings("0.18.0-dev.1124+2ecf4b5e2", master.name);
-    try std.testing.expectEqualStrings("aa", master.sha_sum.?);
+    try std.testing.expectEqualStrings(test_sha_a, master.sha_sum.?);
+    try std.testing.expectEqual(92937573, master.size.?);
 
     try std.testing.expect(null == try findInIndex(gpa, parsed.value, "x86_64-windows", "0.18.0-dev.1005+75d48dfff"));
     try std.testing.expectError(
         error.NoBuildForThisTarget,
         findInIndex(gpa, parsed.value, "aarch64-windows", "0.16.0"),
     );
+}
+
+/// An index entry for this build's target, as ziglang.org lays it out.
+fn testTargetEntry(comptime tarball: []const u8, comptime shasum: []const u8) []const u8 {
+    return "\"" ++ target_info.triple ++ "\": { \"tarball\": " ++ tarball ++ ", \"shasum\": " ++ shasum ++ " }";
+}
+
+fn expectIndexError(comptime expected: anyerror, comptime find: anytype, json: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    if (find(gpa, parsed.value)) |release| {
+        release.deinit(gpa);
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(expected, err);
+}
+
+test "findMaster checks master.version with parseVersion and type-checks every field" {
+    const gpa = std.testing.allocator;
+    const good_target = comptime testTargetEntry("\"https://ziglang.org/builds/x.zip\"", "\"" ++ test_sha_a ++ "\"");
+    const good = "{ \"master\": { \"version\": \"0.18.0-dev.1+abc\", " ++ good_target ++ " } }";
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, gpa, good, .{});
+        defer parsed.deinit();
+        const master = try LatestRelease.findMaster(gpa, parsed.value);
+        defer master.deinit(gpa);
+        try std.testing.expectEqualStrings("0.18.0-dev.1+abc", master.name);
+    }
+    const find = LatestRelease.findMaster;
+    // A version that would be a path, or is not a version at all.
+    try expectIndexError(error.InvalidVersion, find, "{ \"master\": { \"version\": \"../../evil\", " ++ good_target ++ " } }");
+    try expectIndexError(error.InvalidVersion, find, "{ \"master\": { \"version\": \"0.18.0-dev.1+abc/..\", " ++ good_target ++ " } }");
+    try expectIndexError(error.InvalidVersion, find, "{ \"master\": { \"version\": \"master\", " ++ good_target ++ " } }");
+    // Fields of the wrong type.
+    try expectIndexError(error.BadIndex, find, "[]");
+    try expectIndexError(error.BadIndex, find, "{ \"master\": [] }");
+    try expectIndexError(error.BadIndex, find, "{ \"master\": { \"version\": 5, " ++ good_target ++ " } }");
+    try expectIndexError(error.BadIndex, find, "{ \"master\": { \"version\": \"0.18.0-dev.1+abc\", \"" ++ target_info.triple ++ "\": \"x\" } }");
+    try expectIndexError(error.BadIndex, find, "{ \"master\": { \"version\": \"0.18.0-dev.1+abc\", " ++
+        comptime testTargetEntry("7", "\"" ++ test_sha_a ++ "\"") ++ " } }");
+    try expectIndexError(error.BadIndex, find, "{ \"master\": { \"version\": \"0.18.0-dev.1+abc\", " ++
+        comptime testTargetEntry("\"http://ziglang.org/x.zip\"", "\"" ++ test_sha_a ++ "\"") ++ " } }");
+    try expectIndexError(error.BadIndex, find, "{ \"master\": { \"version\": \"0.18.0-dev.1+abc\", " ++
+        comptime testTargetEntry("\"https://ziglang.org/x.zip\"", "{}") ++ " } }");
+    try expectIndexError(error.BadIndex, find, "{ \"master\": { \"version\": \"0.18.0-dev.1+abc\", " ++
+        comptime testTargetEntry("\"https://ziglang.org/x.zip\"", "\"abc\"") ++ " } }");
+    // Missing fields.
+    try expectIndexError(error.NoMasterEntry, find, "{}");
+    try expectIndexError(error.MissingVersionField, find, "{ \"master\": {} }");
+    try expectIndexError(error.NoBuildForThisTarget, find, "{ \"master\": { \"version\": \"0.18.0-dev.1+abc\" } }");
+    try expectIndexError(error.MissingTarballField, find, "{ \"master\": { \"version\": \"0.18.0-dev.1+abc\", \"" ++
+        target_info.triple ++ "\": { \"shasum\": \"" ++ test_sha_a ++ "\" } } }");
+}
+
+test "findLatestStable skips keys that are not versions and type-checks the release" {
+    const gpa = std.testing.allocator;
+    const target = comptime testTargetEntry("\"https://ziglang.org/download/0.16.0/x.zip\"", "\"" ++ test_sha_b ++ "\"");
+    const index = "{ \"master\": {}, \"../9.9.9\": {}, \"0.15.2\": { " ++ target ++ " }, \"0.16.0\": { " ++ target ++ " } }";
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, index, .{});
+    defer parsed.deinit();
+    const stable = try LatestRelease.findLatestStable(gpa, parsed.value);
+    defer stable.deinit(gpa);
+    try std.testing.expectEqualStrings("0.16.0", stable.name);
+
+    const find = LatestRelease.findLatestStable;
+    try expectIndexError(error.BadIndex, find, "\"x\"");
+    try expectIndexError(error.BadIndex, find, "{ \"0.16.0\": 1 }");
+    try expectIndexError(error.BadIndex, find, "{ \"0.16.0\": { \"" ++ target_info.triple ++ "\": [] } }");
+    try expectIndexError(error.NoStableVersionFound, find, "{ \"master\": {} }");
+}
+
+test "the index's declared size is read as a string or a number, anything else is an error" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { size: []const u8, want: anyerror!?u64 }{
+        .{ .size = "\"47906164\"", .want = 47906164 },
+        .{ .size = "47906164", .want = 47906164 },
+        .{ .size = "\"-1\"", .want = error.BadIndex },
+        .{ .size = "-1", .want = error.BadIndex },
+        .{ .size = "[]", .want = error.BadIndex },
+    };
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(gpa, "{{ \"tarball\": \"https://ziglang.org/x.zip\", \"shasum\": \"{s}\", \"size\": {s} }}", .{ test_sha_a, case.size });
+        defer gpa.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+        defer parsed.deinit();
+        if (LatestRelease.initFromObjectMap(gpa, "0.16.0", parsed.value.object)) |release| {
+            defer release.deinit(gpa);
+            try std.testing.expectEqual(try case.want, release.size);
+        } else |err| try std.testing.expectError(err, case.want);
+    }
 }
 
 test "parseMinimumZigVersion reads a full build.zig.zon and ignores the rest" {
