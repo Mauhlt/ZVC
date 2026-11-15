@@ -44,8 +44,8 @@ fn releaseNotes(buf: []u8, version: []const u8) ![]const u8 {
         \\ZVC built and tested with Zig {s}, its known-good version.
         \\
         \\Each binary embeds that version: on a machine with no Zig, a plain run
-        \\installs exactly Zig {s} from ziglang.org (checked against the index's
-        \\sha256, or the archive's minisign signature) and makes it live.
+        \\installs exactly Zig {s} from ziglang.org (checked against the archive's
+        \\minisign signature, and the index's sha256 when listed) and makes it live.
         \\
         \\Binaries: zvc-x86_64-windows.exe, zvc-aarch64-windows.exe,
         \\zvc-x86_64-linux, zvc-aarch64-linux, zvc-x86_64-macos, zvc-aarch64-macos.
