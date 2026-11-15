@@ -1,0 +1,57 @@
+# Builds and publishes ZVC when its known-good Zig record changes on main.
+# All logic lives in Zig (`zig build` steps and ZVC itself); this file only
+# runs them in order. Any failing step stops the job before the release.
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths: [src/known-good-zig.txt]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out the pushed commit
+        run: |
+          gh auth setup-git
+          git init -q .
+          git fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      # The previous release's ZVC (built with a verified Zig) installs the
+      # known-good Zig recorded in this commit: index sha256 or minisign check.
+      - name: Install the known-good Zig with the last released ZVC
+        run: |
+          gh release download --pattern zvc-x86_64-linux --dir "$RUNNER_TEMP/zvc"
+          chmod +x "$RUNNER_TEMP/zvc/zvc-x86_64-linux"
+          "$RUNNER_TEMP/zvc/zvc-x86_64-linux" install --known-good . < /dev/null
+          echo "$HOME/.local/share/zvc/zig" >> "$GITHUB_PATH"
+
+      - name: Check the Zig version
+        run: zig build check-zig
+
+      - name: Test
+        run: zig build test
+
+      - name: Build the six binaries and check them for build-machine paths
+        run: zig build check-dist
+
+      - name: Write the release tag and notes
+        run: zig build release-info
+
+      - name: Create the release
+        run: >-
+          gh release create "$(cat zig-out/release/tag.txt)"
+          zig-out/dist/*
+          --target "$GITHUB_SHA"
+          --title "$(cat zig-out/release/tag.txt)"
+          --notes-file zig-out/release/notes.md
+          --latest
