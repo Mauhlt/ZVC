@@ -233,7 +233,7 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map, mode
             latest.name,
         ) orelse home: {
             std.debug.print(
-                "Warning: {s}'s dir is missing on disk; re-prep it.\n",
+                "Warning: {s}'s dir is missing or incomplete on disk; re-prep it.\n",
                 .{latest.name},
             );
             break :home try prepareVersion(
@@ -807,42 +807,78 @@ fn prepareVersion(
         .replacing = replacing,
     });
 
-    const version_rel = try std.fs.path.join(gpa, &.{ versions_subdir, release.name });
-    defer gpa.free(version_rel);
-    try zvc_dir.createDirPath(io, version_rel);
-    var version_dir = try zvc_dir.openDir(io, version_rel, .{ .iterate = true });
-    defer version_dir.close(io);
-
-    std.log.info("Extract into {s}/{s}", .{ zvc_root, version_rel });
-    try extractArchive(gpa, io, archive, archive_name, version_dir);
-
-    const home_rel = try findZigHome(gpa, io, version_dir, version_rel);
-    defer gpa.free(home_rel);
-    return std.fs.path.join(gpa, &.{ zvc_root, home_rel });
+    return installVersion(gpa, io, zvc_dir, release.name, archive, archive_name);
 }
 
+/// Prefix of the sibling folder a version is extracted into before it is
+/// renamed into place. Never a valid version, so pruning removes leftovers.
+const partial_prefix = ".partial-";
+
+/// Extracts `archive` into `versions/.partial-<name>`, checks that it holds a
+/// zig (executable and lib), and only then renames it to `versions/<name>`.
+/// So a version folder exists only once complete; an interrupted or failed
+/// extraction leaves at most a `.partial-` folder, removed on the next try or
+/// by `zvc clean`. Called once `resolveVersionHome` found no complete folder,
+/// so anything already at `versions/<name>` is an incomplete leftover (e.g.
+/// from an older ZVC that extracted in place) and is replaced.
+/// Returns the zig home, relative to the cwd.
+fn installVersion(
+    gpa: Allocator,
+    io: Io,
+    zvc_dir: Dir,
+    name: []const u8,
+    archive: Io.File,
+    archive_name: []const u8,
+) ![]u8 {
+    const version_rel = try std.fs.path.join(gpa, &.{ versions_subdir, name });
+    defer gpa.free(version_rel);
+    const partial_name = try std.mem.concat(gpa, u8, &.{ partial_prefix, name });
+    defer gpa.free(partial_name);
+    const partial_path = try std.fs.path.join(gpa, &.{ versions_subdir, partial_name });
+    defer gpa.free(partial_path);
+
+    try zvc_dir.deleteTree(io, partial_path);
+    if (try resolveVersionHome(gpa, io, zvc_dir, name)) |home| return home;
+    try zvc_dir.deleteTree(io, version_rel);
+
+    try zvc_dir.createDirPath(io, partial_path);
+    errdefer zvc_dir.deleteTree(io, partial_path) catch {};
+    {
+        var partial_dir = try zvc_dir.openDir(io, partial_path, .{ .iterate = true });
+        defer partial_dir.close(io);
+        std.log.info("Extract into {s}/{s}", .{ zvc_root, partial_path });
+        try extractArchive(gpa, io, archive, archive_name, partial_dir);
+        const home_sub = (try findCompleteHome(gpa, io, partial_dir)) orelse {
+            std.log.warn("{s} holds no {s} and lib folder; not installing it.", .{ archive_name, target_info.exe_name });
+            return error.ArchiveHasNoZig;
+        };
+        gpa.free(home_sub);
+    }
+    try zvc_dir.rename(partial_path, zvc_dir, version_rel, io);
+    return (try resolveVersionHome(gpa, io, zvc_dir, name)) orelse error.ArchiveHasNoZig;
+}
+
+/// The zig home of a complete version folder `versions/<name>`, relative to
+/// the cwd, or null when there is no such folder or it is incomplete (no zig
+/// executable and lib folder).
 fn resolveVersionHome(
     gpa: Allocator,
     io: Io,
     zvc_dir: Dir,
     name: []const u8,
 ) !?[]u8 {
-    const version_rel = try std.fs.path.join(
-        gpa,
-        &.{ versions_subdir, name },
-    );
+    const version_rel = try std.fs.path.join(gpa, &.{ versions_subdir, name });
     defer gpa.free(version_rel);
 
-    var version_dir = zvc_dir.openDir(
-        io,
-        version_rel,
-        .{ .iterate = true },
-    ) catch return null;
+    var version_dir = zvc_dir.openDir(io, version_rel, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
     defer version_dir.close(io);
 
-    const home_rel = try findZigHome(gpa, io, version_dir, version_rel);
-    defer gpa.free(home_rel);
-    return try std.fs.path.join(gpa, &.{ zvc_root, home_rel });
+    const home_sub = (try findCompleteHome(gpa, io, version_dir)) orelse return null;
+    defer gpa.free(home_sub);
+    return try std.fs.path.join(gpa, &.{ zvc_root, version_rel, home_sub });
 }
 
 /// Extracts from the already-verified open `archive_file` (from offset 0),
@@ -874,12 +910,11 @@ fn extractArchive(
     }
 }
 
-fn findZigHome(
-    gpa: Allocator,
-    io: Io,
-    version_dir: Dir,
-    version_rel: []const u8,
-) ![]const u8 {
+/// The zig home inside an extracted version folder, relative to it: its only
+/// entry when that is a directory (how ziglang.org's archives are laid out),
+/// else "" for the folder itself. Null when that home has no zig executable
+/// and lib folder, i.e. the folder is incomplete.
+fn findCompleteHome(gpa: Allocator, io: Io, version_dir: Dir) !?[]u8 {
     var name_buf: [std.fs.max_path_bytes]u8 = undefined;
     var nested_len: usize = 0;
     var entry_count: usize = 0;
@@ -897,9 +932,14 @@ fn findZigHome(
         }
     }
     if (entry_count == 1 and only_entry_is_dir) {
-        return std.fs.path.join(gpa, &.{ version_rel, name_buf[0..nested_len] });
+        const sub = name_buf[0..nested_len];
+        var home = version_dir.openDir(io, sub, .{}) catch return null;
+        defer home.close(io);
+        if (!looksLikeZigInstallDir(io, home)) return null;
+        return try gpa.dupe(u8, sub);
     }
-    return gpa.dupe(u8, version_rel);
+    if (!looksLikeZigInstallDir(io, version_dir)) return null;
+    return try gpa.dupe(u8, "");
 }
 
 fn validateAgainstTestProjects(io: Io, zig_bin: []const u8) !bool {
@@ -2490,6 +2530,129 @@ test "a cached archive is re-verified: kept and returned open if good, deleted i
     try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "cached archive bytez" });
     try std.testing.expectEqual(null, openCachedArchive(io, tmp.dir, name, &release, fixture.sig, pk));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, name, .{}));
+}
+
+/// Builds an uncompressed ("stored") zip of `entries`, which std.zip reads.
+fn testStoredZip(gpa: Allocator, entries: []const [2][]const u8) ![]u8 {
+    var aw: Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const w = &aw.writer;
+    var offsets: [16]u32 = undefined;
+    for (entries, 0..) |entry, i| {
+        offsets[i] = @intCast(aw.writer.buffered().len);
+        const crc = std.hash.Crc32.hash(entry[1]);
+        try w.writeAll("PK\x03\x04");
+        for ([_]u16{ 20, 0, 0, 0, 0 }) |v| try w.writeInt(u16, v, .little);
+        for ([_]u32{ crc, @intCast(entry[1].len), @intCast(entry[1].len) }) |v| try w.writeInt(u32, v, .little);
+        for ([_]u16{ @intCast(entry[0].len), 0 }) |v| try w.writeInt(u16, v, .little);
+        try w.writeAll(entry[0]);
+        try w.writeAll(entry[1]);
+    }
+    const cd_start: u32 = @intCast(aw.writer.buffered().len);
+    for (entries, 0..) |entry, i| {
+        const crc = std.hash.Crc32.hash(entry[1]);
+        try w.writeAll("PK\x01\x02");
+        for ([_]u16{ 20, 20, 0, 0, 0, 0 }) |v| try w.writeInt(u16, v, .little);
+        for ([_]u32{ crc, @intCast(entry[1].len), @intCast(entry[1].len) }) |v| try w.writeInt(u32, v, .little);
+        for ([_]u16{ @intCast(entry[0].len), 0, 0, 0, 0 }) |v| try w.writeInt(u16, v, .little);
+        try w.writeInt(u32, 0, .little);
+        try w.writeInt(u32, offsets[i], .little);
+        try w.writeAll(entry[0]);
+    }
+    const cd_size: u32 = @as(u32, @intCast(aw.writer.buffered().len)) - cd_start;
+    try w.writeAll("PK\x05\x06");
+    for ([_]u16{ 0, 0, @intCast(entries.len), @intCast(entries.len) }) |v| try w.writeInt(u16, v, .little);
+    try w.writeInt(u32, cd_size, .little);
+    try w.writeInt(u32, cd_start, .little);
+    try w.writeInt(u16, 0, .little);
+    return aw.toOwnedSlice();
+}
+
+const test_zig_home = "zig-x86_64-windows-0.16.0";
+const test_zig_entries = [_][2][]const u8{
+    .{ test_zig_home ++ "/" ++ target_info.exe_name, "not really zig" },
+    .{ test_zig_home ++ "/lib/std/std.zig", "// std" },
+};
+
+/// Writes `entries` as a zip in `dir` and returns it open for reading.
+fn testOpenZip(dir: Dir, entries: []const [2][]const u8) !Io.File {
+    const io = std.testing.io;
+    const bytes = try testStoredZip(std.testing.allocator, entries);
+    defer std.testing.allocator.free(bytes);
+    try dir.writeFile(io, .{ .sub_path = "archive.zip", .data = bytes });
+    return dir.openFile(io, "archive.zip", .{});
+}
+
+fn testExists(dir: Dir, sub_path: []const u8) bool {
+    dir.access(std.testing.io, sub_path, .{}) catch return false;
+    return true;
+}
+
+test "installVersion extracts into a .partial- sibling and renames it into place" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, versions_subdir);
+
+    const archive = try testOpenZip(tmp.dir, &test_zig_entries);
+    defer archive.close(io);
+    const home = try installVersion(gpa, io, tmp.dir, "0.16.0", archive, "archive.zip");
+    defer gpa.free(home);
+    const want = try std.fs.path.join(gpa, &.{ zvc_root, versions_subdir, "0.16.0", test_zig_home });
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, home);
+    try std.testing.expect(testExists(tmp.dir, versions_subdir ++ "/0.16.0/" ++ test_zig_home ++ "/lib/std/std.zig"));
+    try std.testing.expect(!testExists(tmp.dir, versions_subdir ++ "/" ++ partial_prefix ++ "0.16.0"));
+
+    const resolved = (try resolveVersionHome(gpa, io, tmp.dir, "0.16.0")).?;
+    defer gpa.free(resolved);
+    try std.testing.expectEqualStrings(want, resolved);
+}
+
+test "a failed extraction leaves no version folder and no .partial- folder" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, versions_subdir);
+
+    // A zip that holds no zig.
+    {
+        const archive = try testOpenZip(tmp.dir, &.{.{ "readme.txt", "hi" }});
+        defer archive.close(io);
+        try std.testing.expectError(error.ArchiveHasNoZig, installVersion(gpa, io, tmp.dir, "0.16.0", archive, "archive.zip"));
+    }
+    // A truncated zip: the zig is written, then extraction fails.
+    {
+        const bytes = try testStoredZip(gpa, &test_zig_entries);
+        defer gpa.free(bytes);
+        try tmp.dir.writeFile(io, .{ .sub_path = "archive.zip", .data = bytes[0 .. bytes.len - 30] });
+        const archive = try tmp.dir.openFile(io, "archive.zip", .{});
+        defer archive.close(io);
+        try std.testing.expect(std.meta.isError(installVersion(gpa, io, tmp.dir, "0.16.0", archive, "archive.zip")));
+    }
+    try std.testing.expect(!testExists(tmp.dir, versions_subdir ++ "/0.16.0"));
+    try std.testing.expect(!testExists(tmp.dir, versions_subdir ++ "/" ++ partial_prefix ++ "0.16.0"));
+    try std.testing.expectEqual(null, try resolveVersionHome(gpa, io, tmp.dir, "0.16.0"));
+}
+
+test "a partly extracted version folder is not installed; it is replaced, leftovers removed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // What an interrupted in-place extraction (older ZVC) or rename leaves.
+    try tmp.dir.createDirPath(io, versions_subdir ++ "/0.16.0/" ++ test_zig_home ++ "/lib");
+    try tmp.dir.createDirPath(io, versions_subdir ++ "/" ++ partial_prefix ++ "0.16.0/junk");
+    try std.testing.expectEqual(null, try resolveVersionHome(gpa, io, tmp.dir, "0.16.0"));
+
+    const archive = try testOpenZip(tmp.dir, &test_zig_entries);
+    defer archive.close(io);
+    const home = try installVersion(gpa, io, tmp.dir, "0.16.0", archive, "archive.zip");
+    defer gpa.free(home);
+    try std.testing.expect(testExists(tmp.dir, versions_subdir ++ "/0.16.0/" ++ test_zig_home ++ "/" ++ target_info.exe_name));
+    try std.testing.expect(!testExists(tmp.dir, versions_subdir ++ "/" ++ partial_prefix ++ "0.16.0"));
 }
 
 test "keepVersion: two slots, plus the pin and the active version" {
