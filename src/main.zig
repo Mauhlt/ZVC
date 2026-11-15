@@ -356,30 +356,92 @@ fn refreshOtherSlot(
     gpa.free(home);
 }
 
+/// Size caps on everything ZVC downloads, so a broken or hostile server
+/// cannot fill the disk or memory. Zig's archives are under 100 MB.
+const max_index_bytes: u64 = 16 << 20;
+const max_signature_bytes: u64 = 4 << 10;
+/// For a build the index does not list (it declares no size).
+const default_max_archive_bytes: u64 = 200 << 20;
+/// Added to the size the index declares (the sha256 must match anyway).
+const archive_size_margin: u64 = 1 << 20;
+/// Never more than this, whatever the index declares.
+const hard_max_archive_bytes: u64 = 1 << 30;
+
+fn maxArchiveBytes(release: *const LatestRelease) u64 {
+    const declared = release.size orelse return default_max_archive_bytes;
+    return @min(declared +| archive_size_margin, hard_max_archive_bytes);
+}
+
 fn fetchIndexJson(gpa: Allocator, client: *std.http.Client) ![]u8 {
-    return fetchBytes(gpa, client, index_url) catch |err| switch (err) {
+    return fetchBytes(gpa, client, index_url, max_index_bytes) catch |err| switch (err) {
         error.HttpNotFound, error.HttpStatus => return error.IndexFetchFailed,
         else => return err,
     };
 }
 
-/// GETs `url` into memory. A 404 is its own error so callers can say the
-/// file is gone rather than that the request failed.
-fn fetchBytes(gpa: Allocator, client: *std.http.Client, url: []const u8) ![]u8 {
-    var aw: Io.Writer.Allocating = .init(gpa);
-    defer aw.deinit();
+/// Passes bytes on to `out`, but fails with error.WriteFailed (and sets
+/// `exceeded`) rather than let more than `limit` bytes through in total.
+const CappedWriter = struct {
+    out: *Io.Writer,
+    limit: u64,
+    written: u64 = 0,
+    exceeded: bool = false,
+    writer: Io.Writer,
 
-    const result = try client.fetch(.{
+    fn init(out: *Io.Writer, limit: u64, buffer: []u8) CappedWriter {
+        return .{
+            .out = out,
+            .limit = limit,
+            .writer = .{ .buffer = buffer, .vtable = &.{ .drain = drain } },
+        };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *CappedWriter = @alignCast(@fieldParentPtr("writer", w));
+        var incoming: u64 = w.end;
+        for (data[0 .. data.len - 1]) |bytes| incoming += bytes.len;
+        incoming +|= std.math.mul(u64, data[data.len - 1].len, splat) catch std.math.maxInt(u64);
+        if (incoming > self.limit - self.written) {
+            self.exceeded = true;
+            return error.WriteFailed;
+        }
+        try self.out.writeAll(w.buffered());
+        self.written += w.end;
+        w.end = 0;
+        const n = try self.out.writeSplat(data, splat);
+        self.written += n;
+        return n;
+    }
+};
+
+/// GETs `url` into `out`, at most `limit` bytes. A 404 is its own error so
+/// callers can say the file is gone rather than that the request failed.
+fn fetchCapped(client: *std.http.Client, url: []const u8, out: *Io.Writer, limit: u64) !void {
+    var buf: [1 << 14]u8 = undefined;
+    var capped: CappedWriter = .init(out, limit, &buf);
+    const result = client.fetch(.{
         .location = .{ .url = url },
-        .response_writer = &aw.writer,
-    });
+        .response_writer = &capped.writer,
+    }) catch |err| switch (err) {
+        error.WriteFailed => return if (capped.exceeded) error.DownloadTooLarge else err,
+        else => return err,
+    };
+    capped.writer.flush() catch |err|
+        return if (capped.exceeded) error.DownloadTooLarge else err;
+    try out.flush();
     switch (result.status) {
         .ok => {},
         .not_found => return error.HttpNotFound,
         else => return error.HttpStatus,
     }
+}
 
-    return gpa.dupe(u8, aw.writer.buffered());
+/// GETs `url` into memory, at most `limit` bytes.
+fn fetchBytes(gpa: Allocator, client: *std.http.Client, url: []const u8, limit: u64) ![]u8 {
+    var aw: Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try fetchCapped(client, url, &aw.writer, limit);
+    return aw.toOwnedSlice();
 }
 
 const LatestRelease = struct {
@@ -488,134 +550,163 @@ fn isNightlyVersionName(name: []const u8) bool {
     return std.mem.indexOf(u8, name, "-dev") != null;
 }
 
-fn downloadFile(
-    io: Io,
-    client: *std.http.Client,
-    url: []const u8,
-    dest_dir: Dir,
-    dest_name: []const u8,
-) !void {
-    var out_file = try dest_dir.createFile(io, dest_name, .{});
-    defer out_file.close(io);
-
-    var buf: [1 << 16]u8 = undefined;
-    var file_writer = out_file.writer(io, &buf);
-
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &file_writer.interface,
-    });
-    try file_writer.flush();
-
-    if (result.status != .ok) return error.DownloadFailed;
+/// True if `archive_name` is the archive ziglang.org publishes for `version`
+/// on arch-os: `zig-<arch>-<os>-<version>.<ext>`, or the older
+/// `zig-<os>-<arch>-<version>.<ext>`. The minisign check binds the signature
+/// to this name, so this binds it to the version ZVC installs under: a
+/// validly signed older build cannot be passed off as a newer version.
+fn archiveNameMatches(
+    archive_name: []const u8,
+    arch: []const u8,
+    os: []const u8,
+    version: []const u8,
+    ext: []const u8,
+) bool {
+    for ([_][2][]const u8{ .{ arch, os }, .{ os, arch } }) |order| {
+        var buf: [256]u8 = undefined;
+        const want = std.fmt.bufPrint(&buf, "zig-{s}-{s}-{s}.{s}", .{ order[0], order[1], version, ext }) catch
+            return false;
+        if (std.mem.eql(u8, archive_name, want)) return true;
+    }
+    return false;
 }
 
-fn sha256HexOfFile(
-    io: Io,
-    dir: Dir,
-    file_name: []const u8,
-) ![64]u8 {
-    const digest = try hashFile(std.crypto.hash.sha2.Sha256, io, dir, file_name);
-    return std.fmt.bytesToHex(digest, .lower);
-}
+const ArchiveCheckError = MinisignError || Io.File.Reader.Error || error{
+    ArchiveTooLarge,
+    Sha256Mismatch,
+};
 
-fn hashFile(
-    comptime Hash: type,
+/// Verifies the open archive `file` in one pass from offset 0: no more than
+/// `max_bytes`, the minisign `signature` under `public_key` (required), and
+/// the index's sha256 when there is one. Reads through the handle only, so
+/// what is checked is what the same handle then extracts.
+fn verifyArchive(
     io: Io,
-    dir: Dir,
-    file_name: []const u8,
-) ![Hash.digest_length]u8 {
-    var file = try dir.openFile(io, file_name, .{});
-    defer file.close(io);
-
+    file: Io.File,
+    archive_name: []const u8,
+    sha_sum: ?[]const u8,
+    signature: []const u8,
+    public_key: []const u8,
+    max_bytes: u64,
+) ArchiveCheckError!void {
     var read_buf: [1 << 16]u8 = undefined;
     var file_reader = file.reader(io, &read_buf);
 
-    var hasher = Hash.init(.{});
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var blake = std.crypto.hash.blake2.Blake2b512.init(.{});
+    var total: u64 = 0;
     var chunk: [1 << 16]u8 = undefined;
     while (true) {
-        const n = try file_reader.interface.readSliceShort(&chunk);
-        hasher.update(chunk[0..n]);
+        const n = file_reader.interface.readSliceShort(&chunk) catch
+            return file_reader.err.?;
+        total += n;
+        if (total > max_bytes) return error.ArchiveTooLarge;
+        sha.update(chunk[0..n]);
+        blake.update(chunk[0..n]);
         if (n < chunk.len) break;
     }
 
-    var digest: [Hash.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    return digest;
+    var blake_digest: [64]u8 = undefined;
+    blake.final(&blake_digest);
+    try verifyMinisign(signature, public_key, &blake_digest, archive_name);
+
+    if (sha_sum) |expected| {
+        var sha_digest: [32]u8 = undefined;
+        sha.final(&sha_digest);
+        const actual = std.fmt.bytesToHex(sha_digest, .lower);
+        if (!std.ascii.eqlIgnoreCase(&actual, expected)) return error.Sha256Mismatch;
+    }
 }
 
-fn ensureArchiveDownloaded(
+fn verifyMethod(release: *const LatestRelease) []const u8 {
+    return if (release.sha_sum != null) "minisign + sha256" else "minisign";
+}
+
+/// Opens a cached download and checks it exactly as a fresh one. Returns the
+/// still-open, locked handle if it passes; otherwise deletes it, returns null.
+fn openCachedArchive(
+    io: Io,
+    downloads_dir: Dir,
+    archive_name: []const u8,
+    release: *const LatestRelease,
+    signature: []const u8,
+    public_key: []const u8,
+) ?Io.File {
+    const file = downloads_dir.openFile(io, archive_name, .{ .lock = .exclusive }) catch return null;
+    if (verifyArchive(io, file, archive_name, release.sha_sum, signature, public_key, maxArchiveBytes(release))) |_| {
+        std.log.info("Using cached download {s} ({s} verified)", .{ archive_name, verifyMethod(release) });
+        return file;
+    } else |err| {
+        file.close(io);
+        std.log.info("Cached download {s} failed its check ({t}); discarding it.", .{ archive_name, err });
+        downloads_dir.deleteFile(io, archive_name) catch {};
+        return null;
+    }
+}
+
+/// Returns an open, locked handle on the archive of `release` in
+/// `downloads_dir` that passed `verifyArchive`: the cached copy if it passes,
+/// else a fresh download. The caller extracts from this same handle and
+/// closes it.
+///
+/// Every archive needs ziglang.org's minisign signature, fetched first; a
+/// missing signature fails before any download. An index build is checked
+/// against its sha256 as well.
+fn openVerifiedArchive(
     gpa: Allocator,
     io: Io,
     client: *std.http.Client,
     downloads_dir: Dir,
     release: *const LatestRelease,
     archive_name: []const u8,
-) !void {
-    // A build found outside the index has no published sha sum. Fetch its
-    // minisign signature first, so a build that is gone fails before any
-    // download starts.
-    const signature: ?[]u8 = if (release.sha_sum == null)
-        try fetchSignature(gpa, client, release.tarball)
-    else
-        null;
-    defer if (signature) |sig| gpa.free(sig);
-    const method = if (signature == null) "sha256" else "minisign";
-
-    if (downloads_dir.access(io, archive_name, .{})) |_| {
-        if (try archiveVerified(io, downloads_dir, archive_name, release, signature)) {
-            std.log.info(
-                "Using cached download {s} ({s} verified)",
-                .{ archive_name, method },
-            );
-            return;
-        }
-        std.log.info(
-            "Cached download {s} failed its {s} check; Discarding.",
-            .{ archive_name, method },
-        );
-    } else |_| {}
-    std.log.info("Downloading {s}", .{release.tarball});
-    try downloadFile(io, client, release.tarball, downloads_dir, archive_name);
-
-    if (!try archiveVerified(io, downloads_dir, archive_name, release, signature)) {
-        downloads_dir.deleteFile(io, archive_name) catch {};
-        return error.DownloadVerificationFailed;
+) !Io.File {
+    if (!archiveNameMatches(archive_name, target_info.arch_name, target_info.os_name, release.name, archive_ext)) {
+        std.log.err("{s} is not the archive of zig {s} for {s}; refusing it.", .{ archive_name, release.name, target_info.triple });
+        return error.UnexpectedArchiveName;
     }
-    std.log.info("Downloaded {s} ({s} verified)", .{ archive_name, method });
-}
-
-/// Checks a downloaded archive against the index's sha256 when there is one,
-/// otherwise against ziglang.org's minisign signature for that file.
-fn archiveVerified(
-    io: Io,
-    dir: Dir,
-    archive_name: []const u8,
-    release: *const LatestRelease,
-    signature: ?[]const u8,
-) !bool {
-    if (release.sha_sum) |expected| {
-        const actual = try sha256HexOfFile(io, dir, archive_name);
-        if (std.mem.eql(u8, &actual, expected)) return true;
-        std.log.info(
-            "Hash mismatch for {s}:\nExpected {s}\nActual:   {s}",
-            .{ archive_name, expected, actual },
-        );
-        return false;
-    }
-    const digest = try hashFile(std.crypto.hash.blake2.Blake2b512, io, dir, archive_name);
-    verifyMinisign(signature.?, zig_minisign_key, &digest, archive_name) catch |err| {
-        std.log.info("Signature check failed for {s}: {t}", .{ archive_name, err });
-        return false;
+    const signature = fetchSignature(gpa, client, release.tarball) catch |err| switch (err) {
+        error.SignatureNotFound => {
+            // Outside the index a missing signature means the build is gone.
+            if (release.sha_sum == null) return error.VersionNotOnServer;
+            std.log.err("ziglang.org has no signature for {s}; refusing it.", .{archive_name});
+            return error.SignatureMissing;
+        },
+        else => return err,
     };
-    return true;
+    defer gpa.free(signature);
+
+    if (openCachedArchive(io, downloads_dir, archive_name, release, signature, zig_minisign_key)) |cached|
+        return cached;
+
+    std.log.info("Downloading {s}", .{release.tarball});
+    const max_bytes = maxArchiveBytes(release);
+    const file = try downloads_dir.createFile(io, archive_name, .{ .read = true, .lock = .exclusive });
+    errdefer {
+        file.close(io);
+        downloads_dir.deleteFile(io, archive_name) catch {};
+    }
+    {
+        var buf: [1 << 16]u8 = undefined;
+        var file_writer = file.writer(io, &buf);
+        fetchCapped(client, release.tarball, &file_writer.interface, max_bytes) catch |err| switch (err) {
+            error.HttpNotFound, error.HttpStatus => return error.DownloadFailed,
+            error.WriteFailed => return file_writer.err orelse err,
+            else => return err,
+        };
+    }
+    verifyArchive(io, file, archive_name, release.sha_sum, signature, zig_minisign_key, max_bytes) catch |err| {
+        std.log.err("Downloaded {s} failed its check: {t}", .{ archive_name, err });
+        return error.DownloadVerificationFailed;
+    };
+    std.log.info("Downloaded {s} ({s} verified)", .{ archive_name, verifyMethod(release) });
+    return file;
 }
 
 fn fetchSignature(gpa: Allocator, client: *std.http.Client, tarball_url: []const u8) ![]u8 {
     const sig_url = try std.mem.concat(gpa, u8, &.{ tarball_url, ".minisig" });
     defer gpa.free(sig_url);
-    return fetchBytes(gpa, client, sig_url) catch |err| switch (err) {
-        error.HttpNotFound => return error.VersionNotOnServer,
+    return fetchBytes(gpa, client, sig_url, max_signature_bytes) catch |err| switch (err) {
+        error.HttpNotFound => return error.SignatureNotFound,
         else => return err,
     };
 }
@@ -704,7 +795,8 @@ fn prepareVersion(
     if (try resolveVersionHome(gpa, io, zvc_dir, release.name)) |home| return home;
 
     const archive_name = std.fs.path.basenamePosix(release.tarball);
-    try ensureArchiveDownloaded(gpa, io, client, downloads_dir, release, archive_name);
+    const archive = try openVerifiedArchive(gpa, io, client, downloads_dir, release, archive_name);
+    defer archive.close(io);
 
     const pinned = try readPointerFile(gpa, io, zvc_dir, pin_file);
     defer if (pinned) |p| gpa.free(p);
@@ -722,7 +814,7 @@ fn prepareVersion(
     defer version_dir.close(io);
 
     std.log.info("Extract into {s}/{s}", .{ zvc_root, version_rel });
-    try extractArchive(gpa, io, downloads_dir, archive_name, version_dir);
+    try extractArchive(gpa, io, archive, archive_name, version_dir);
 
     const home_rel = try findZigHome(gpa, io, version_dir, version_rel);
     defer gpa.free(home_rel);
@@ -753,16 +845,15 @@ fn resolveVersionHome(
     return try std.fs.path.join(gpa, &.{ zvc_root, home_rel });
 }
 
+/// Extracts from the already-verified open `archive_file` (from offset 0),
+/// never from a path that could have changed since the check.
 fn extractArchive(
     gpa: Allocator,
     io: Io,
-    archive_dir: Dir,
+    archive_file: Io.File,
     archive_name: []const u8,
     dest_dir: Dir,
 ) !void {
-    var archive_file = try archive_dir.openFile(io, archive_name, .{});
-    defer archive_file.close(io);
-
     var read_buf: [1 << 16]u8 = undefined;
     var file_reader = archive_file.reader(io, &read_buf);
 
@@ -1651,7 +1742,7 @@ fn resolvePinnedRelease(
         };
         defer parsed.deinit();
         if (try findInIndex(gpa, parsed.value, target_info.triple, version)) |release| {
-            std.debug.print("Found {s} in the index (sha256 check).\n", .{version});
+            std.debug.print("Found {s} in the index (minisign + sha256 check).\n", .{version});
             return release;
         }
         std.debug.print(
@@ -2278,6 +2369,127 @@ test "verifyMinisign accepts a real ziglang.org signature with the built-in key"
         error.SignatureMismatch,
         verifyMinisign(sig_file, zig_minisign_key, &digest, name),
     );
+}
+
+/// A signed archive fixture: `bytes` under `name`, signed with TestSigner.
+const TestArchive = struct {
+    signer: TestSigner,
+    pk_buf: [56]u8,
+    sig_buf: [512]u8,
+    sha_hex: [64]u8,
+    sig: []const u8,
+
+    /// In place: `sig` points into `sig_buf`.
+    fn init(self: *TestArchive, bytes: []const u8, name: []const u8) !void {
+        self.signer = try .init();
+        var digest: [64]u8 = undefined;
+        std.crypto.hash.blake2.Blake2b512.hash(bytes, &digest, .{});
+        var trusted_buf: [256]u8 = undefined;
+        const trusted = try std.fmt.bufPrint(&trusted_buf, "timestamp:1700000000\tfile:{s}\thashed", .{name});
+        self.sig = try self.signer.signatureFile(&self.sig_buf, "ED", &digest, trusted);
+        var sha: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &sha, .{});
+        self.sha_hex = std.fmt.bytesToHex(sha, .lower);
+    }
+
+    fn publicKey(self: *TestArchive) []const u8 {
+        return self.signer.publicKey(&self.pk_buf);
+    }
+};
+
+test "CappedWriter lets the limit through and fails past it" {
+    const gpa = std.testing.allocator;
+    var aw: Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    var buf: [4]u8 = undefined;
+    var capped: CappedWriter = .init(&aw.writer, 10, &buf);
+    try capped.writer.writeAll("0123456789");
+    try capped.writer.flush();
+    try std.testing.expectEqualStrings("0123456789", aw.writer.buffered());
+    try std.testing.expect(!capped.exceeded);
+    try capped.writer.writeAll("x");
+    try std.testing.expectError(error.WriteFailed, capped.writer.flush());
+    try std.testing.expect(capped.exceeded);
+    try std.testing.expectEqual(10, aw.writer.buffered().len);
+}
+
+test "maxArchiveBytes: declared size plus a margin, capped; a default without one" {
+    var release: LatestRelease = .{ .name = "0.16.0", .tarball = "", .sha_sum = null };
+    try std.testing.expectEqual(default_max_archive_bytes, maxArchiveBytes(&release));
+    release.size = 90 << 20;
+    try std.testing.expectEqual((90 << 20) + archive_size_margin, maxArchiveBytes(&release));
+    release.size = std.math.maxInt(u64);
+    try std.testing.expectEqual(hard_max_archive_bytes, maxArchiveBytes(&release));
+}
+
+test "archiveNameMatches binds the archive to the version it installs as" {
+    const v = "0.18.0-dev.1005+75d48dfff";
+    try std.testing.expect(archiveNameMatches("zig-x86_64-windows-" ++ v ++ ".zip", "x86_64", "windows", v, "zip"));
+    try std.testing.expect(archiveNameMatches("zig-windows-x86_64-0.13.0.zip", "x86_64", "windows", "0.13.0", "zip"));
+    try std.testing.expect(archiveNameMatches("zig-aarch64-macos-0.16.0.tar.xz", "aarch64", "macos", "0.16.0", "tar.xz"));
+    // An older (validly signed) build named as a newer version.
+    try std.testing.expect(!archiveNameMatches("zig-x86_64-windows-0.15.1.zip", "x86_64", "windows", "0.16.0", "zip"));
+    try std.testing.expect(!archiveNameMatches("zig-aarch64-windows-0.16.0.zip", "x86_64", "windows", "0.16.0", "zip"));
+    try std.testing.expect(!archiveNameMatches("zig-x86_64-windows-0.16.0.tar.xz", "x86_64", "windows", "0.16.0", "zip"));
+    try std.testing.expect(!archiveNameMatches("..", "x86_64", "windows", "0.16.0", "zip"));
+}
+
+test "verifyArchive requires the signature, and the sha256 when there is one, from one handle" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const name = "zig-x86_64-windows-0.16.0.zip";
+    const bytes = "pretend this is a zip";
+    var fixture: TestArchive = undefined;
+    try fixture.init(bytes, name);
+    const pk = fixture.publicKey();
+    try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+    const file = try tmp.dir.openFile(io, name, .{});
+    defer file.close(io);
+
+    // Signature and sha256 both good; the signature alone (outside the index).
+    try verifyArchive(io, file, name, &fixture.sha_hex, fixture.sig, pk, 1 << 20);
+    try verifyArchive(io, file, name, null, fixture.sig, pk, 1 << 20);
+    // A good signature does not excuse a wrong sha256.
+    try std.testing.expectError(error.Sha256Mismatch, verifyArchive(io, file, name, test_sha_a, fixture.sig, pk, 1 << 20));
+    // A good sha256 does not excuse a missing or bad signature.
+    try std.testing.expectError(error.BadSignatureFile, verifyArchive(io, file, name, &fixture.sha_hex, "", pk, 1 << 20));
+    try std.testing.expectError(error.KeyIdMismatch, verifyArchive(io, file, name, &fixture.sha_hex, fixture.sig, zig_minisign_key, 1 << 20));
+    // Signed for another file name.
+    try std.testing.expectError(error.WrongFile, verifyArchive(io, file, "zig-x86_64-windows-0.15.1.zip", &fixture.sha_hex, fixture.sig, pk, 1 << 20));
+    // Larger than allowed.
+    try std.testing.expectError(error.ArchiveTooLarge, verifyArchive(io, file, name, &fixture.sha_hex, fixture.sig, pk, bytes.len - 1));
+    try verifyArchive(io, file, name, &fixture.sha_hex, fixture.sig, pk, bytes.len);
+
+    // Other bytes under the same name.
+    try tmp.dir.writeFile(io, .{ .sub_path = "other", .data = "pretend this is a zap" });
+    const other = try tmp.dir.openFile(io, "other", .{});
+    defer other.close(io);
+    try std.testing.expectError(error.SignatureMismatch, verifyArchive(io, other, name, null, fixture.sig, pk, 1 << 20));
+}
+
+test "a cached archive is re-verified: kept and returned open if good, deleted if not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const name = "zig-x86_64-windows-0.16.0.zip";
+    const bytes = "cached archive bytes";
+    var fixture: TestArchive = undefined;
+    try fixture.init(bytes, name);
+    const pk = fixture.publicKey();
+    const release: LatestRelease = .{ .name = "0.16.0", .tarball = "", .sha_sum = &fixture.sha_hex };
+
+    try std.testing.expectEqual(null, openCachedArchive(io, tmp.dir, name, &release, fixture.sig, pk));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+    const good = openCachedArchive(io, tmp.dir, name, &release, fixture.sig, pk) orelse
+        return error.TestExpectedCachedArchive;
+    good.close(io);
+    try tmp.dir.access(io, name, .{});
+
+    try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "cached archive bytez" });
+    try std.testing.expectEqual(null, openCachedArchive(io, tmp.dir, name, &release, fixture.sig, pk));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, name, .{}));
 }
 
 test "keepVersion: two slots, plus the pin and the active version" {
