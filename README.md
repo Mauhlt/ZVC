@@ -83,17 +83,16 @@ version first, then write `.zvc/active-version.txt` (and set or clear
 live zig fails, the previous version stays active and on disk.
 
 ## New device
-Download the prebuilt ZVC for the machine from the latest release
-(`<repo>` is this repository's GitHub URL):
+Download the prebuilt ZVC for the machine from the latest release:
 
 | Machine | Download |
 | --- | --- |
-| Windows x86_64 | `<repo>/releases/latest/download/zvc-x86_64-windows.exe` |
-| Windows on ARM (aarch64) | `<repo>/releases/latest/download/zvc-aarch64-windows.exe` |
-| Linux x86_64 | `<repo>/releases/latest/download/zvc-x86_64-linux` |
-| Linux aarch64 | `<repo>/releases/latest/download/zvc-aarch64-linux` |
-| macOS Intel | `<repo>/releases/latest/download/zvc-x86_64-macos` |
-| macOS Apple silicon | `<repo>/releases/latest/download/zvc-aarch64-macos` |
+| Windows x86_64 | [zvc-x86_64-windows.exe](https://github.com/Mauhlt/ZVC/releases/latest/download/zvc-x86_64-windows.exe) |
+| Windows on ARM (aarch64) | [zvc-aarch64-windows.exe](https://github.com/Mauhlt/ZVC/releases/latest/download/zvc-aarch64-windows.exe) |
+| Linux x86_64 | [zvc-x86_64-linux](https://github.com/Mauhlt/ZVC/releases/latest/download/zvc-x86_64-linux) |
+| Linux aarch64 | [zvc-aarch64-linux](https://github.com/Mauhlt/ZVC/releases/latest/download/zvc-aarch64-linux) |
+| macOS Intel | [zvc-x86_64-macos](https://github.com/Mauhlt/ZVC/releases/latest/download/zvc-x86_64-macos) |
+| macOS Apple silicon | [zvc-aarch64-macos](https://github.com/Mauhlt/ZVC/releases/latest/download/zvc-aarch64-macos) |
 
 1. Clone ZVC and, next to it, the project that needs a specific Zig (e.g. Portal).
    Put the downloaded binary in the ZVC folder (on Linux and macOS, `chmod +x` it).
