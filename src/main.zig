@@ -49,81 +49,13 @@ const target_info: TargetInfo = detect: {
     };
 };
 
-const Subcommands = enum(u64) {
+const Subcommands = enum {
     clean,
     reset,
     install,
     update,
     version,
-    _,
 };
-
-const String = struct {
-    buf: []u8,
-    len: usize,
-
-    fn init(buf: []u8, len: usize) @This() {
-        return .{
-            .buf = buf,
-            .len = len,
-        };
-    }
-
-    pub fn deinit(self: *@This(), gpa: Allocator) void {
-        gpa.free(self.buf);
-    }
-
-    pub fn toStr(self: *const @This()) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
-
-fn getCwdPath(io: Io, gpa: Allocator) !String {
-    const buf = try gpa.alloc(u8, Dir.max_path_bytes);
-    const len = try Dir.cwd().realPath(io, buf);
-    return .init(buf, len);
-}
-
-fn getExePath(io: Io, gpa: Allocator) !String {
-    const buf = try std.process.executableDirPathAlloc(io, gpa);
-    const index = std.mem.indexOf(u8, buf, "zig-out").?;
-    return .init(buf, index - 1);
-}
-
-// fn getZVCPath(io: Io, gpa: Allocator) !String {
-//     const exe_path = try getExePath(io, gpa);
-//     std.debug.print("Exe Path: {s}\n", .{exe_path});
-//     // const index = std.mem.indexOf(u8, exe_path, "zig-out").?;
-//     // return exe_path[0 .. index - 1];
-//     return exe_path;
-// }
-
-test "Path" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-
-    // The cwd helper agrees with the process's real working directory.
-    var cwd_path = try getCwdPath(io, gpa);
-    defer cwd_path.deinit(gpa);
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
-    const cwd_real = try Dir.realPathFileAbsoluteAlloc(io, cwd, gpa);
-    defer gpa.free(cwd_real);
-    try std.testing.expectEqualStrings(cwd_real, cwd_path.toStr());
-
-    // The exe helper returns the folder that holds zig-out. Test binaries run
-    // from the build cache, so check it only when the exe is under zig-out.
-    const exe_dir = try std.process.executableDirPathAlloc(io, gpa);
-    defer gpa.free(exe_dir);
-    const zig_out = std.mem.indexOf(u8, exe_dir, "zig-out") orelse return;
-    var exe_path = try getExePath(io, gpa);
-    defer exe_path.deinit(gpa);
-    try std.testing.expectEqualStrings(exe_dir[0 .. zig_out - 1], exe_path.toStr());
-
-    // const zvc_path = try getZVCPath(io, gpa);
-    // defer gpa.free(zvc_path);
-    // std.debug.print("{s}\n", .{zvc_path});
-}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -141,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
             return error.UnknownSubcommand;
         };
         switch (command) {
-            .clean => return error.Unimplemented,
+            .clean => return doClean(gpa, io),
             .reset => return doReset(gpa, io),
             .install => {
                 const version = try installArgs(gpa, io, &args_it);
@@ -153,7 +85,6 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("ZVC known-good zig: {s}\n", .{known_good_zig});
                 return;
             },
-            _ => return error.Unimplemented,
         }
     }
 
@@ -1427,6 +1358,93 @@ fn doReset(gpa: Allocator, io: Io) !void {
     ,
         .{ stable.name, master.name },
     );
+}
+
+/// `zvc clean`: frees disk space without touching what works. Offline.
+fn doClean(gpa: Allocator, io: Io) !void {
+    var zvc_dir = Dir.cwd().openDir(io, zvc_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("No {s} folder here; nothing to clean.\n", .{zvc_root});
+            return;
+        },
+        else => return err,
+    };
+    defer zvc_dir.close(io);
+    const active = try readPointerFile(gpa, io, zvc_dir, active_file);
+    defer if (active) |a| gpa.free(a);
+    const live_real_path = currentLiveRealPath(gpa, io, zvc_dir);
+    defer if (live_real_path) |p| gpa.free(p);
+    try cleanZvcDir(gpa, io, zvc_dir, active, live_real_path);
+}
+
+/// Deletes every downloaded archive (the extracted versions do not need
+/// them; one is downloaded again if ever needed), every `.partial-` folder,
+/// and every incomplete version folder except the active one and the one the
+/// live zig points into. Complete versions are left to the usual pruning.
+fn cleanZvcDir(
+    gpa: Allocator,
+    io: Io,
+    zvc_dir: Dir,
+    active: ?[]const u8,
+    live_real_path: ?[]const u8,
+) !void {
+    var doomed: std.ArrayList([]u8) = .empty;
+    defer {
+        for (doomed.items) |name| gpa.free(name);
+        doomed.deinit(gpa);
+    }
+
+    if (zvc_dir.openDir(io, downloads_subdir, .{ .iterate = true })) |opened| {
+        var downloads_dir = opened;
+        defer downloads_dir.close(io);
+        var it = downloads_dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            try doomed.append(gpa, try gpa.dupe(u8, entry.name));
+        }
+        for (doomed.items) |name| {
+            std.log.info("Removing download {s}", .{name});
+            downloads_dir.deleteFile(io, name) catch |err|
+                std.log.warn("Could not remove {s}: {t}", .{ name, err });
+        }
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    for (doomed.items) |name| gpa.free(name);
+    doomed.clearRetainingCapacity();
+
+    var versions_dir = zvc_dir.openDir(io, versions_subdir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer versions_dir.close(io);
+    var it = versions_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const name = entry.name;
+        if (!std.mem.startsWith(u8, name, partial_prefix)) {
+            if (active) |a| if (std.mem.eql(u8, a, name)) continue;
+            var version_dir = versions_dir.openDir(io, name, .{ .iterate = true }) catch continue;
+            defer version_dir.close(io);
+            const home = try findCompleteHome(gpa, io, version_dir);
+            if (home) |h| {
+                gpa.free(h);
+                continue;
+            }
+            if (live_real_path) |live| live: {
+                const real = versions_dir.realPathFileAlloc(io, name, gpa) catch break :live;
+                defer gpa.free(real);
+                if (pathIsWithin(real, live)) continue;
+            }
+        }
+        try doomed.append(gpa, try gpa.dupe(u8, name));
+    }
+    for (doomed.items) |name| {
+        std.log.info("Removing incomplete {s}/{s}/{s}", .{ zvc_root, versions_subdir, name });
+        versions_dir.deleteTree(io, name) catch |err|
+            std.log.warn("Could not remove {s}: {t}", .{ name, err });
+    }
 }
 
 // Pinned installs: `zvc install <version>` and `zvc install --from <project>`.
@@ -2718,6 +2736,43 @@ test "validateAgainstTestProjects: skipped without a list, fails when a project 
     // A listed project the candidate cannot build: not promoted.
     try tmp.dir.writeFile(io, .{ .sub_path = test_projects_file, .data = "zvc-test-no-such-project\n" });
     try std.testing.expect(!try validateAgainstTestProjects(gpa, io, tmp.dir, no_zig));
+}
+
+test "clean removes downloads, .partial- and incomplete folders, never the active or live one" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    try d.createDirPath(io, downloads_subdir);
+    try d.writeFile(io, .{ .sub_path = downloads_subdir ++ "/zig-x86_64-windows-0.16.0.zip", .data = "x" });
+    try d.writeFile(io, .{ .sub_path = downloads_subdir ++ "/zig-x86_64-linux-0.16.0.tar.xz", .data = "x" });
+    // Complete: kept.
+    try d.createDirPath(io, versions_subdir ++ "/0.16.0/zig/lib");
+    try d.writeFile(io, .{ .sub_path = versions_subdir ++ "/0.16.0/zig/" ++ target_info.exe_name, .data = "x" });
+    // Incomplete: removed, unless active or live.
+    try d.createDirPath(io, versions_subdir ++ "/0.17.0/zig/lib");
+    try d.createDirPath(io, versions_subdir ++ "/0.18.0-dev.1+abc/zig/lib");
+    try d.createDirPath(io, versions_subdir ++ "/0.15.0/zig/lib");
+    try d.createDirPath(io, versions_subdir ++ "/" ++ partial_prefix ++ "0.19.0/zig");
+
+    const live = try d.realPathFileAlloc(io, versions_subdir ++ "/0.15.0/zig", gpa);
+    defer gpa.free(live);
+    try cleanZvcDir(gpa, io, d, "0.18.0-dev.1+abc", live);
+
+    try std.testing.expect(!testExists(d, downloads_subdir ++ "/zig-x86_64-windows-0.16.0.zip"));
+    try std.testing.expect(!testExists(d, downloads_subdir ++ "/zig-x86_64-linux-0.16.0.tar.xz"));
+    try std.testing.expect(testExists(d, versions_subdir ++ "/0.16.0"));
+    try std.testing.expect(!testExists(d, versions_subdir ++ "/0.17.0"));
+    try std.testing.expect(testExists(d, versions_subdir ++ "/0.18.0-dev.1+abc"));
+    try std.testing.expect(testExists(d, versions_subdir ++ "/0.15.0"));
+    try std.testing.expect(!testExists(d, versions_subdir ++ "/" ++ partial_prefix ++ "0.19.0"));
+
+    // An empty or missing .zvc layout is fine.
+    var empty = std.testing.tmpDir(.{ .iterate = true });
+    defer empty.cleanup();
+    try cleanZvcDir(gpa, io, empty.dir, null, null);
 }
 
 test "keepVersion: two slots, plus the pin and the active version" {

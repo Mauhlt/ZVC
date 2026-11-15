@@ -28,6 +28,7 @@ source is `zig-out/bin/ZVC[.exe]`.
 | `zvc install --known-good <ZVC repo>` | The same, for the version in that repo's `src/known-good-zig.txt` |
 | `zvc version` | Print the known-good Zig compiled into this ZVC |
 | `zvc reset` | Wipe versions and downloads, re-seed latest stable + master, promote nothing, clear the pin |
+| `zvc clean` | Offline: delete every downloaded archive, every `.partial-` folder and every incomplete version folder; never the active version or the folder the live zig points into |
 
 With `zig build run`, pass arguments after `--`: `zig build run -- install --from ../Portal`.
 
