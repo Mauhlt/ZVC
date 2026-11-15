@@ -63,19 +63,34 @@ exactly that version and makes it live. If ziglang.org no longer has it, ZVC say
 so and installs nothing; then choose explicitly with `zvc update` or
 `zvc install <version>`.
 
+### How downloads are checked
+Every archive ZVC installs (update, install, reset, the known-good bootstrap)
+must carry a valid `.minisig` signature from the Zig Software Foundation's
+public key built into ZVC, and the signed comment must name the archive, whose
+name must be `zig-<arch>-<os>-<version>.<ext>` for the version it installs as.
+The signature is fetched first: if it is missing or bad, nothing is installed.
+An archive the index lists must also match the index's sha256. A cached
+archive in `.zvc/downloads/` is checked the same way before it is used.
+
+Downloads are capped while they stream: an archive at the size the index
+declares plus 1 MiB (200 MiB when the index lists none), the index at 16 MiB.
+The archive is checked and extracted through the same open file, then
+extracted into `.zvc/versions/.partial-<version>` and renamed to
+`.zvc/versions/<version>` only once it holds a zig and its `lib` folder, so an
+interrupted install never leaves a version that looks installed.
+
 ### Where `install` finds a version
 1. `ziglang.org/download/index.json`: every tagged release, plus the newest dev
-   build (`master`). Downloads found here are checked against the index's sha256.
+   build (`master`).
 2. Otherwise the build's direct URL: `https://ziglang.org/builds/zig-<arch>-<os>-<version>.<zip|tar.xz>`
    for dev builds, `https://ziglang.org/download/<version>/...` for releases. The
-   index only lists the newest dev build, so older ones come from here. These are
-   checked against the `.minisig` signature beside the archive, using the Zig
-   Software Foundation's public key built into ZVC; the signed comment must name
-   the requested file.
+   index only lists the newest dev build, so older ones come from here, checked
+   by their signature alone.
 3. ziglang.org deletes superseded dev builds after a while. If the signature is
    gone, `install` stops with an error saying so, and nothing is changed.
 
-A version already in `.zvc/versions/` is activated without any network access.
+A version already complete in `.zvc/versions/` is activated without any
+network access.
 
 ### Which versions stay on disk
 ZVC keeps two slots, the **newest stable** and the **newest nightly** in
@@ -134,10 +149,13 @@ because ZVC replaces a zig it finds on PATH with a link to the version it manage
   notes to `zig-out/release/`.
 
 `.github/workflows/release.yml` runs these on ubuntu-latest when a push to main
-changes `src/known-good-zig.txt` (or on a manual run). It installs the
-known-good Zig with the previous release's `zvc-x86_64-linux`, runs `check-zig`,
-`test`, `check-dist` and `release-info`, then creates a release marked latest
-with the six binaries. Any failing step means no release.
+changes `src/known-good-zig.txt` (or on a manual run). Its `build` job (read-only,
+no token) installs the known-good Zig with the previous release's
+`zvc-x86_64-linux`, runs `check-zig`, `test`, `check-dist` and `release-info`,
+and uploads the six binaries, tag and notes as an artifact. Its `publish` job
+(`contents: write`, the token on its one step) downloads them and creates a
+release marked latest. The two artifact actions are pinned by commit SHA. Any
+failing step means no release.
 
 Because the workflow uses the previous release's ZVC, the first release has to
 be made by hand, once, with the known-good Zig on PATH:
