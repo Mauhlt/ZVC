@@ -35,6 +35,20 @@ With `zig build run`, pass arguments after `--`: `zig build run -- install --fro
 on a device that must stay on a pinned version; re-pin with `zvc install --from`
 if you do.
 
+### Test projects
+Before an update or an install promotes a new zig, ZVC runs `zig build test`
+with it in every project listed in `.zvc/test-projects.txt`, one folder per
+line (absolute, or relative to the folder ZVC runs in); blank lines and lines
+starting with `#` are ignored. If any project fails, the new zig is not
+promoted. The file does not exist by default: then ZVC prints
+`No test projects configured ...: compatibility check skipped.` and promotes
+without the check. For example:
+```text
+# projects every new zig must build and test
+../Portal
+../Renderer
+```
+
 ### Known-good Zig
 `src/known-good-zig.txt` holds the Zig version ZVC was last built and tested
 with, and every ZVC binary embeds it. When ZVC promotes a version (an update or an
@@ -150,7 +164,7 @@ gh release create <tag from zig-out/release/tag.txt> zig-out/dist/* --notes-file
 - .zip on windows
 - into .zvm/versions/<version>/
 5. Run configuration 
-- zig build test against list of projects using candidate compiler before trusting it 
+- zig build test against list of projects using candidate compiler before trusting it (the list is `.zvc/test-projects.txt`, see Test projects)
 6. Success = promote, Failure = Reject
 - Promote: write active version pointer + delete old version directory 
 - Reject: keep old active, leave candidate on disk, print clear breaking-change message

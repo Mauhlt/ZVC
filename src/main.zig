@@ -16,8 +16,9 @@ const index_url = "https://ziglang.org/download/index.json";
 const Channel = enum { stable, nightly };
 const channel: Channel = .nightly; // default
 
-// paths to projects to auto-test
-const test_projects = [_][]const u8{};
+/// In `.zvc/`: the projects a candidate zig is tested against before it is
+/// promoted (see `parseTestProjects`). Absent by default.
+const test_projects_file = "test-projects.txt";
 
 const TargetInfo = struct {
     os_name: []const u8,
@@ -280,7 +281,7 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map, mode
     defer gpa.free(zig_bin);
     std.debug.print("Candidate Compiler: {s}\n", .{zig_bin});
 
-    if (try validateAgainstTestProjects(io, zig_bin)) {
+    if (try validateAgainstTestProjects(gpa, io, zvc_dir, zig_bin)) {
         activateVersion(gpa, io, zvc_dir, environ_map, .{
             .name = latest.name,
             .home = candidate_home,
@@ -942,13 +943,45 @@ fn findCompleteHome(gpa: Allocator, io: Io, version_dir: Dir) !?[]u8 {
     return try gpa.dupe(u8, "");
 }
 
-fn validateAgainstTestProjects(io: Io, zig_bin: []const u8) !bool {
-    if (test_projects.len == 0) {
-        std.debug.print("No test projects configured; Skipping compatibility checks.\n", .{});
+/// The project folders a candidate zig must pass `zig build test` in before
+/// it is promoted, from `.zvc/test-projects.txt`: one folder per line
+/// (absolute, or relative to the folder ZVC runs in), blank lines and lines
+/// starting with `#` ignored. No file means no projects. The returned slices
+/// point into `text`.
+fn parseTestProjects(gpa: Allocator, text: []const u8) ![][]const u8 {
+    var projects: std.ArrayList([]const u8) = .empty;
+    errdefer projects.deinit(gpa);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (std.mem.indexOfScalar(u8, line, 0) != null) return error.InvalidTestProjectPath;
+        try projects.append(gpa, line);
+    }
+    return projects.toOwnedSlice(gpa);
+}
+
+/// Runs `zig build test` with the candidate in every configured test project
+/// (see `parseTestProjects`); true if all pass. With none configured it says
+/// so and the check is skipped.
+fn validateAgainstTestProjects(gpa: Allocator, io: Io, zvc_dir: Dir, zig_bin: []const u8) !bool {
+    const text = zvc_dir.readFileAlloc(io, test_projects_file, gpa, .limited(64 << 10)) catch |err| switch (err) {
+        error.FileNotFound => try gpa.dupe(u8, ""),
+        else => return err,
+    };
+    defer gpa.free(text);
+    const projects = try parseTestProjects(gpa, text);
+    defer gpa.free(projects);
+
+    if (projects.len == 0) {
+        std.debug.print(
+            "No test projects configured in {s}/{s} (one project folder per line): compatibility check skipped.\n",
+            .{ zvc_root, test_projects_file },
+        );
         return true;
     }
     var all_ok = true;
-    for (test_projects) |project_path| {
+    for (projects) |project_path| {
         std.debug.print("Testing candidate against {s}\n", .{project_path});
         if (!try zigBuildTestPasses(io, zig_bin, project_path)) all_ok = false;
     }
@@ -1945,7 +1978,7 @@ fn doInstall(
     const zig_bin = try cwd.realPathFileAlloc(io, zig_rel, gpa);
     defer gpa.free(zig_bin);
 
-    if (!try validateAgainstTestProjects(io, zig_bin)) {
+    if (!try validateAgainstTestProjects(gpa, io, zvc_dir, zig_bin)) {
         std.log.err(
             "Zig {s} failed the test projects; {s} stays active.",
             .{ version, active_version orelse "nothing" },
@@ -2653,6 +2686,38 @@ test "a partly extracted version folder is not installed; it is replaced, leftov
     defer gpa.free(home);
     try std.testing.expect(testExists(tmp.dir, versions_subdir ++ "/0.16.0/" ++ test_zig_home ++ "/" ++ target_info.exe_name));
     try std.testing.expect(!testExists(tmp.dir, versions_subdir ++ "/" ++ partial_prefix ++ "0.16.0"));
+}
+
+test "parseTestProjects: one folder per line, blanks and # comments ignored" {
+    const gpa = std.testing.allocator;
+    const projects = try parseTestProjects(gpa, "# projects\r\n\r\n  ../Portal  \r\n/abs/path\n\t# off\n../Renderer");
+    defer gpa.free(projects);
+    try std.testing.expectEqual(3, projects.len);
+    try std.testing.expectEqualStrings("../Portal", projects[0]);
+    try std.testing.expectEqualStrings("/abs/path", projects[1]);
+    try std.testing.expectEqualStrings("../Renderer", projects[2]);
+
+    const none = try parseTestProjects(gpa, "# nothing yet\n\n");
+    defer gpa.free(none);
+    try std.testing.expectEqual(0, none.len);
+    try std.testing.expectError(error.InvalidTestProjectPath, parseTestProjects(gpa, "a\x00b"));
+}
+
+test "validateAgainstTestProjects: skipped without a list, fails when a project fails" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const no_zig = "zvc-test-no-such-zig-executable";
+
+    // No file, or only comments: nothing to run, explicitly skipped.
+    try std.testing.expect(try validateAgainstTestProjects(gpa, io, tmp.dir, no_zig));
+    try tmp.dir.writeFile(io, .{ .sub_path = test_projects_file, .data = "# none yet\n" });
+    try std.testing.expect(try validateAgainstTestProjects(gpa, io, tmp.dir, no_zig));
+
+    // A listed project the candidate cannot build: not promoted.
+    try tmp.dir.writeFile(io, .{ .sub_path = test_projects_file, .data = "zvc-test-no-such-project\n" });
+    try std.testing.expect(!try validateAgainstTestProjects(gpa, io, tmp.dir, no_zig));
 }
 
 test "keepVersion: two slots, plus the pin and the active version" {
