@@ -97,15 +97,23 @@ test "Path" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
 
-    const cwd_path = try getCwdPath(io, gpa);
-    defer gpa.free(cwd_path);
-    std.testing.expectEqual("~\\Code\\Zig\\ZVC", cwd_path) catch //
-        std.debug.print("Cwd Path failed.", .{});
+    // The cwd helper agrees with the process's real working directory.
+    var cwd_path = try getCwdPath(io, gpa);
+    defer cwd_path.deinit(gpa);
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const cwd_real = try Dir.realPathFileAbsoluteAlloc(io, cwd, gpa);
+    defer gpa.free(cwd_real);
+    try std.testing.expectEqualStrings(cwd_real, cwd_path.toStr());
 
-    const exe_path = try getExePath(io, gpa);
-    defer gpa.free(exe_path);
-    std.testing.expectEqual("~\\Code\\Zig\\ZVC\\zig-out\\bin", exe_path) catch //
-        std.debug.print("Exe Path failed.", .{});
+    // The exe helper returns the folder that holds zig-out. Test binaries run
+    // from the build cache, so check it only when the exe is under zig-out.
+    const exe_dir = try std.process.executableDirPathAlloc(io, gpa);
+    defer gpa.free(exe_dir);
+    const zig_out = std.mem.indexOf(u8, exe_dir, "zig-out") orelse return;
+    var exe_path = try getExePath(io, gpa);
+    defer exe_path.deinit(gpa);
+    try std.testing.expectEqualStrings(exe_dir[0 .. zig_out - 1], exe_path.toStr());
 
     // const zvc_path = try getZVCPath(io, gpa);
     // defer gpa.free(zvc_path);
