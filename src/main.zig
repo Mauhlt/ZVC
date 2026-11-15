@@ -10,6 +10,7 @@ const downloads_subdir = "downloads";
 const active_file = "active-version.txt";
 const log_file = "log.txt";
 const live_path_file = "live-path.txt";
+const pin_file = "pinned-version.txt";
 const index_url = "https://ziglang.org/download/index.json";
 
 const Channel = enum { stable, nightly };
@@ -50,6 +51,8 @@ const target_info: TargetInfo = detect: {
 const Subcommands = enum(u64) {
     clean,
     reset,
+    install,
+    update,
     _,
 };
 
@@ -130,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
     if (args_it.next()) |subcommand| {
         const command = std.meta.stringToEnum(Subcommands, subcommand) orelse { //
             std.log.err(
-                "Unknown subcommand \"{s}\" (expected clean, reset, or no arg)",
+                "Unknown subcommand \"{s}\" (expected clean, reset, install, update, or no arg)",
                 .{subcommand},
             );
             return error.UnknownSubcommand;
@@ -138,14 +141,24 @@ pub fn main(init: std.process.Init) !void {
         switch (command) {
             .clean => return error.Unimplemented,
             .reset => return doReset(gpa, io),
+            .install => {
+                const version = try installArgs(gpa, io, &args_it);
+                defer gpa.free(version);
+                return doInstall(gpa, io, init.environ_map, version);
+            },
+            .update => return run(io, gpa, init.environ_map, .update),
             _ => return error.Unimplemented,
         }
     }
 
-    try run(io, gpa, init.environ_map);
+    try run(io, gpa, init.environ_map, .default);
 }
 
-fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map) !void {
+/// `.default` (no subcommand) leaves a pinned version alone; `.update` is the
+/// explicit "move to the newest release" and clears the pin once it promotes.
+const RunMode = enum { default, update };
+
+fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map, mode: RunMode) !void {
     std.debug.print(
         \\Detected: {s}-{s}
         \\Found:    {s}
@@ -166,23 +179,26 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map) !voi
     var downloads_dir = try zvc_dir.openDir(io, downloads_subdir, .{ .iterate = true });
     defer downloads_dir.close(io);
 
-    const active_raw: ?[]u8 = zvc_dir.readFileAlloc(
-        io,
-        active_file,
-        gpa,
-        .limited(1024),
-    ) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
-    defer if (active_raw) |raw| gpa.free(raw);
-    const active_version = if (active_raw) |raw| std.mem.trim(u8, raw, "\r\n") //
-        else null;
+    const active_version = try readPointerFile(gpa, io, zvc_dir, active_file);
+    defer if (active_version) |v| gpa.free(v);
 
     if (active_version) |curr_version| //
         std.debug.print("Current active version: {s}\n", .{curr_version})
     else //
         std.debug.print("No active version recorded yet.\n", .{});
+
+    if (mode == .default) {
+        const pinned = try readPointerFile(gpa, io, zvc_dir, pin_file);
+        defer if (pinned) |p| gpa.free(p);
+        if (pinned) |p| {
+            std.debug.print(
+                \\Pinned to {s} by `zvc install`; not updating.
+                \\Run `zvc update` to move to the newest {t} release and clear the pin.
+                \\
+            , .{ p, channel });
+            return;
+        }
+    }
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
@@ -232,6 +248,9 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map) !voi
         };
         defer gpa.free(candidate_home);
         candidate_ok = true;
+        // Only `zvc update` gets here with a pin set (a plain run returned
+        // above), and the pinned version is the newest one: drop the pin.
+        clearPin(io, zvc_dir);
         try finishRun(
             gpa,
             io,
@@ -269,15 +288,7 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map) !voi
     candidate_ok = try validateAgainstTestProjects(io, zig_bin);
 
     if (candidate_ok) {
-        try zvc_dir.writeFile(io, .{ .sub_path = active_file, .data = latest.name });
-        if (active_version) |old| {
-            const old_rel = try std.fs.path.join(gpa, &.{ versions_subdir, old });
-            defer gpa.free(old_rel);
-            zvc_dir.deleteTree(io, old_rel) catch |err| {
-                std.log.warn("Failed to remove old version. {s}: {t}\n", .{ old, err });
-            };
-        }
-        std.log.info("Promoted zig version: {s} to active.\n", .{latest.name});
+        try promoteVersion(gpa, io, zvc_dir, latest.name, active_version, .unpin);
     } else {
         std.log.info(
             \\Breaking Change Detected 
@@ -339,16 +350,27 @@ fn finishRun(
 }
 
 fn fetchIndexJson(gpa: Allocator, client: *std.http.Client) ![]u8 {
+    return fetchBytes(gpa, client, index_url) catch |err| switch (err) {
+        error.HttpNotFound, error.HttpStatus => return error.IndexFetchFailed,
+        else => return err,
+    };
+}
+
+/// GETs `url` into memory. A 404 is its own error so callers can say the
+/// file is gone rather than that the request failed.
+fn fetchBytes(gpa: Allocator, client: *std.http.Client, url: []const u8) ![]u8 {
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
 
     const result = try client.fetch(.{
-        .location = .{
-            .url = index_url,
-        },
+        .location = .{ .url = url },
         .response_writer = &aw.writer,
     });
-    if (result.status != .ok) return error.IndexFetchFailed;
+    switch (result.status) {
+        .ok => {},
+        .not_found => return error.HttpNotFound,
+        else => return error.HttpStatus,
+    }
 
     return gpa.dupe(u8, aw.writer.buffered());
 }
@@ -356,7 +378,9 @@ fn fetchIndexJson(gpa: Allocator, client: *std.http.Client) ![]u8 {
 const LatestRelease = struct {
     name: []const u8,
     tarball: []const u8,
-    sha_sum: []const u8,
+    /// null for a build found outside the index (an older dev build): its
+    /// minisign signature is checked instead.
+    sha_sum: ?[]const u8,
 
     pub fn initFromValue(gpa: Allocator, root: std.json.Value) !@This() {
         return switch (channel) {
@@ -368,7 +392,7 @@ const LatestRelease = struct {
     pub fn deinit(self: *const @This(), gpa: Allocator) void {
         gpa.free(self.name);
         gpa.free(self.tarball);
-        gpa.free(self.sha_sum);
+        if (self.sha_sum) |sum| gpa.free(sum);
     }
 
     pub fn initFromObjectMap(
@@ -451,13 +475,23 @@ fn sha256HexOfFile(
     dir: Dir,
     file_name: []const u8,
 ) ![64]u8 {
+    const digest = try hashFile(std.crypto.hash.sha2.Sha256, io, dir, file_name);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn hashFile(
+    comptime Hash: type,
+    io: Io,
+    dir: Dir,
+    file_name: []const u8,
+) ![Hash.digest_length]u8 {
     var file = try dir.openFile(io, file_name, .{});
     defer file.close(io);
 
     var read_buf: [1 << 16]u8 = undefined;
     var file_reader = file.reader(io, &read_buf);
 
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var hasher = Hash.init(.{});
     var chunk: [1 << 16]u8 = undefined;
     while (true) {
         const n = try file_reader.interface.readSliceShort(&chunk);
@@ -465,45 +499,85 @@ fn sha256HexOfFile(
         if (n < chunk.len) break;
     }
 
-    var digest: [32]u8 = undefined;
+    var digest: [Hash.digest_length]u8 = undefined;
     hasher.final(&digest);
-    return std.fmt.bytesToHex(digest, .lower);
+    return digest;
 }
 
 fn ensureArchiveDownloaded(
+    gpa: Allocator,
     io: Io,
     client: *std.http.Client,
     downloads_dir: Dir,
     release: *const LatestRelease,
     archive_name: []const u8,
 ) !void {
+    // A build found outside the index has no published sha sum. Fetch its
+    // minisign signature first, so a build that is gone fails before any
+    // download starts.
+    const signature: ?[]u8 = if (release.sha_sum == null)
+        try fetchSignature(gpa, client, release.tarball)
+    else
+        null;
+    defer if (signature) |sig| gpa.free(sig);
+    const method = if (signature == null) "sha256" else "minisign";
+
     if (downloads_dir.access(io, archive_name, .{})) |_| {
-        const cached_hex = try sha256HexOfFile(io, downloads_dir, archive_name);
-        if (std.mem.eql(u8, &cached_hex, release.sha_sum)) {
+        if (try archiveVerified(io, downloads_dir, archive_name, release, signature)) {
             std.log.info(
-                "Using cached download {s} (sha256 verified)",
-                .{archive_name},
+                "Using cached download {s} ({s} verified)",
+                .{ archive_name, method },
             );
             return;
         }
         std.log.info(
-            "Cached download {s} does not match the published sha sum; Discarding.",
-            .{archive_name},
+            "Cached download {s} failed its {s} check; Discarding.",
+            .{ archive_name, method },
         );
     } else |_| {}
     std.log.info("Downloading {s}", .{release.tarball});
     try downloadFile(io, client, release.tarball, downloads_dir, archive_name);
 
-    const fresh_hex = try sha256HexOfFile(io, downloads_dir, archive_name);
-    if (!std.mem.eql(u8, &fresh_hex, release.sha_sum)) {
+    if (!try archiveVerified(io, downloads_dir, archive_name, release, signature)) {
         downloads_dir.deleteFile(io, archive_name) catch {};
-        std.log.info(
-            "Download hash mismatch for {s}:\nExpected {s}\nActual:   {s}",
-            .{ archive_name, release.sha_sum, fresh_hex },
-        );
-        return error.DownloadHashMismatch;
+        return error.DownloadVerificationFailed;
     }
-    std.log.info("Downloaded {s} (sha256 verified)", .{archive_name});
+    std.log.info("Downloaded {s} ({s} verified)", .{ archive_name, method });
+}
+
+/// Checks a downloaded archive against the index's sha256 when there is one,
+/// otherwise against ziglang.org's minisign signature for that file.
+fn archiveVerified(
+    io: Io,
+    dir: Dir,
+    archive_name: []const u8,
+    release: *const LatestRelease,
+    signature: ?[]const u8,
+) !bool {
+    if (release.sha_sum) |expected| {
+        const actual = try sha256HexOfFile(io, dir, archive_name);
+        if (std.mem.eql(u8, &actual, expected)) return true;
+        std.log.info(
+            "Hash mismatch for {s}:\nExpected {s}\nActual:   {s}",
+            .{ archive_name, expected, actual },
+        );
+        return false;
+    }
+    const digest = try hashFile(std.crypto.hash.blake2.Blake2b512, io, dir, archive_name);
+    verifyMinisign(signature.?, zig_minisign_key, &digest, archive_name) catch |err| {
+        std.log.info("Signature check failed for {s}: {t}", .{ archive_name, err });
+        return false;
+    };
+    return true;
+}
+
+fn fetchSignature(gpa: Allocator, client: *std.http.Client, tarball_url: []const u8) ![]u8 {
+    const sig_url = try std.mem.concat(gpa, u8, &.{ tarball_url, ".minisig" });
+    defer gpa.free(sig_url);
+    return fetchBytes(gpa, client, sig_url) catch |err| switch (err) {
+        error.HttpNotFound => return error.VersionNotOnServer,
+        else => return err,
+    };
 }
 
 /// True if `path_or_child` is `ancestor` itself, or a path underneath it.
@@ -590,7 +664,7 @@ fn prepareVersion(
     if (try resolveVersionHome(gpa, io, zvc_dir, release.name)) |home| return home;
 
     const archive_name = std.fs.path.basenamePosix(release.tarball);
-    try ensureArchiveDownloaded(io, client, downloads_dir, release, archive_name);
+    try ensureArchiveDownloaded(gpa, io, client, downloads_dir, release, archive_name);
 
     const live_real_path = currentLiveRealPath(gpa, io, zvc_dir);
     defer if (live_real_path) |p| gpa.free(p);
@@ -1096,6 +1170,7 @@ fn doReset(gpa: Allocator, io: Io) !void {
     zvc_dir.deleteTree(io, versions_subdir) catch {};
     zvc_dir.deleteTree(io, downloads_subdir) catch {};
     zvc_dir.deleteFile(io, active_file) catch {};
+    clearPin(io, zvc_dir);
 
     try zvc_dir.createDirPath(io, versions_subdir);
     try zvc_dir.createDirPath(io, downloads_subdir);
@@ -1146,4 +1221,668 @@ fn doReset(gpa: Allocator, io: Io) !void {
     ,
         .{ stable.name, master.name },
     );
+}
+
+// Pinned installs: `zvc install <version>` and `zvc install --from <project>`.
+//
+// A pin installs one exact version, makes it active and points the live zig
+// at it. A plain `zvc` run then leaves it alone; `zvc update` is the one way
+// back to the newest release, and it clears the pin once that promotes.
+
+/// The Zig Software Foundation's minisign key, as published on
+/// ziglang.org/download. Every archive there has a `<archive>.minisig` beside it.
+const zig_minisign_key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+const zig_download_host = "https://ziglang.org";
+const archive_ext = switch (builtin.os.tag) {
+    .windows => "zip",
+    else => "tar.xz",
+};
+
+/// Reads a one-line pointer file (`active-version.txt`, `pinned-version.txt`).
+fn readPointerFile(gpa: Allocator, io: Io, zvc_dir: Dir, name: []const u8) !?[]u8 {
+    const raw = zvc_dir.readFileAlloc(io, name, gpa, .limited(1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer gpa.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try gpa.dupe(u8, trimmed);
+}
+
+fn clearPin(io: Io, zvc_dir: Dir) void {
+    zvc_dir.deleteFile(io, pin_file) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => std.log.warn("Could not remove {s}/{s}: {t}", .{ zvc_root, pin_file, err }),
+    };
+}
+
+const PinAction = enum { pin, unpin };
+
+/// Records `new_name` as active, sets or clears the pin, then removes the
+/// previous active version's directory, so only the active one stays.
+fn promoteVersion(
+    gpa: Allocator,
+    io: Io,
+    zvc_dir: Dir,
+    new_name: []const u8,
+    old_active: ?[]const u8,
+    pin: PinAction,
+) !void {
+    try zvc_dir.writeFile(io, .{ .sub_path = active_file, .data = new_name });
+    switch (pin) {
+        .pin => try zvc_dir.writeFile(io, .{ .sub_path = pin_file, .data = new_name }),
+        .unpin => clearPin(io, zvc_dir),
+    }
+    if (old_active) |old| remove: {
+        if (std.mem.eql(u8, old, new_name)) break :remove;
+        // The name comes from a file on disk; never let it walk out of versions/.
+        _ = parseVersion(old) catch {
+            std.log.warn("Not removing old version \"{s}\": not a version name.", .{old});
+            break :remove;
+        };
+        const old_rel = try std.fs.path.join(gpa, &.{ versions_subdir, old });
+        defer gpa.free(old_rel);
+        zvc_dir.deleteTree(io, old_rel) catch |err| {
+            std.log.warn("Failed to remove old version. {s}: {t}\n", .{ old, err });
+        };
+    }
+    std.log.info("Promoted zig version: {s} to active.\n", .{new_name});
+}
+
+/// Validates a Zig version such as `0.16.0` or `0.18.0-dev.1005+75d48dfff`.
+/// It becomes a directory name and part of a URL, so only semver text passes.
+fn parseVersion(text: []const u8) error{InvalidVersion}![]const u8 {
+    const version = std.mem.trim(u8, text, " \t\r\n");
+    if (version.len == 0 or version.len > 64) return error.InvalidVersion;
+    for (version) |ch| switch (ch) {
+        '0'...'9', 'a'...'z', 'A'...'Z', '.', '-', '+' => {},
+        else => return error.InvalidVersion,
+    };
+    _ = std.SemanticVersion.parse(version) catch return error.InvalidVersion;
+    return version;
+}
+
+fn archiveFileName(
+    gpa: Allocator,
+    triple: []const u8,
+    version: []const u8,
+    ext: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(gpa, "zig-{s}-{s}.{s}", .{ triple, version, ext });
+}
+
+/// Where ziglang.org serves a build the index no longer lists: dev builds
+/// under /builds/ (the same place the index's "master" entry points), tagged
+/// releases under /download/<version>/. Releases are always in the index, so
+/// in practice only dev builds take this path.
+fn directTarballUrl(
+    gpa: Allocator,
+    triple: []const u8,
+    version: []const u8,
+    ext: []const u8,
+) ![]u8 {
+    const name = try archiveFileName(gpa, triple, version, ext);
+    defer gpa.free(name);
+    return if (isNightlyVersionName(version))
+        std.fmt.allocPrint(gpa, "{s}/builds/{s}", .{ zig_download_host, name })
+    else
+        std.fmt.allocPrint(gpa, "{s}/download/{s}/{s}", .{ zig_download_host, version, name });
+}
+
+/// The index lists every tagged release by key, and only the newest dev
+/// build (under "master"). Older dev builds return null.
+fn findInIndex(
+    gpa: Allocator,
+    root: std.json.Value,
+    triple: []const u8,
+    version: []const u8,
+) !?LatestRelease {
+    if (root != .object) return error.BadIndex;
+    const release_obj = root.object.get(version) orelse master: {
+        const master = root.object.get("master") orelse return null;
+        if (master != .object) return error.BadIndex;
+        const name = master.object.get("version") orelse return null;
+        if (name != .string or !std.mem.eql(u8, name.string, version)) return null;
+        break :master master;
+    };
+    if (release_obj != .object) return error.BadIndex;
+    const target = release_obj.object.get(triple) orelse return error.NoBuildForThisTarget;
+    if (target != .object) return error.BadIndex;
+    return try LatestRelease.initFromObjectMap(gpa, version, target.object);
+}
+
+fn resolvePinnedRelease(
+    gpa: Allocator,
+    client: *std.http.Client,
+    version: []const u8,
+) !LatestRelease {
+    from_index: {
+        std.debug.print("Looking for {s} in {s}...\n", .{ version, index_url });
+        const bytes = fetchIndexJson(gpa, client) catch |err| {
+            std.log.warn("Could not read the index ({t}); trying the direct URL.", .{err});
+            break :from_index;
+        };
+        defer gpa.free(bytes);
+        var parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |err| {
+            std.log.warn("Could not parse the index ({t}); trying the direct URL.", .{err});
+            break :from_index;
+        };
+        defer parsed.deinit();
+        if (try findInIndex(gpa, parsed.value, target_info.triple, version)) |release| {
+            std.debug.print("Found {s} in the index (sha256 check).\n", .{version});
+            return release;
+        }
+        std.debug.print(
+            "{s} is not in the index (it lists only the newest dev build); " ++
+                "trying ziglang.org directly (minisign check).\n",
+            .{version},
+        );
+    }
+    const tarball = try directTarballUrl(gpa, target_info.triple, version, archive_ext);
+    errdefer gpa.free(tarball);
+    return .{
+        .name = try gpa.dupe(u8, version),
+        .tarball = tarball,
+        .sha_sum = null,
+    };
+}
+
+/// `zvc install <version>` or `zvc install --from <project dir | build.zig.zon>`.
+fn installArgs(gpa: Allocator, io: Io, args_it: *std.process.Args.Iterator) ![]u8 {
+    const usage = "Usage: zvc install <version> | zvc install --from <project dir>";
+    const first = args_it.next() orelse {
+        std.log.err("{s}", .{usage});
+        return error.MissingVersion;
+    };
+    const version = if (std.mem.eql(u8, first, "--from")) from: {
+        const project = args_it.next() orelse {
+            std.log.err("{s}", .{usage});
+            return error.MissingProjectPath;
+        };
+        break :from try readProjectZigVersion(gpa, io, project);
+    } else try gpa.dupe(u8, parseVersion(first) catch |err| {
+        std.log.err(
+            "\"{s}\" is not a Zig version (e.g. 0.16.0 or 0.18.0-dev.1005+75d48dfff).",
+            .{first},
+        );
+        return err;
+    });
+    errdefer gpa.free(version);
+    if (args_it.next()) |extra| {
+        std.log.err("Unexpected argument \"{s}\". {s}", .{ extra, usage });
+        return error.UnexpectedArgument;
+    }
+    return version;
+}
+
+fn readProjectZigVersion(gpa: Allocator, io: Io, project_path: []const u8) ![]u8 {
+    const zon_path = if (std.mem.endsWith(u8, project_path, ".zon"))
+        try gpa.dupe(u8, project_path)
+    else
+        try std.fs.path.join(gpa, &.{ project_path, "build.zig.zon" });
+    defer gpa.free(zon_path);
+
+    const source = Dir.cwd().readFileAllocOptions(
+        io,
+        zon_path,
+        gpa,
+        .limited(1 << 20),
+        .of(u8),
+        0,
+    ) catch |err| {
+        std.log.err("Could not read {s}: {t}", .{ zon_path, err });
+        return err;
+    };
+    defer gpa.free(source);
+
+    const version = parseMinimumZigVersion(gpa, source) catch |err| {
+        std.log.err("{s} has no usable minimum_zig_version ({t}).", .{ zon_path, err });
+        return err;
+    };
+    std.debug.print("{s} asks for zig {s}\n", .{ zon_path, version });
+    return version;
+}
+
+/// Reads `.minimum_zig_version` from build.zig.zon source; every other field
+/// is ignored.
+fn parseMinimumZigVersion(gpa: Allocator, source: [:0]const u8) ![]u8 {
+    const Manifest = struct { minimum_zig_version: ?[]const u8 = null };
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const manifest = std.zon.parse.fromSlice(Manifest, .{
+        .gpa = gpa,
+        .arena = arena.allocator(),
+        .source = source,
+        .diagnostics = &diagnostics,
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ParseZon => return error.InvalidBuildZon,
+    };
+    const raw = manifest.minimum_zig_version orelse return error.NoMinimumZigVersion;
+    return gpa.dupe(u8, try parseVersion(raw));
+}
+
+fn doInstall(
+    gpa: Allocator,
+    io: Io,
+    environ_map: *const std.process.Environ.Map,
+    version: []const u8,
+) !void {
+    const cwd = Dir.cwd();
+    try cwd.createDirPath(io, zvc_root);
+    var zvc_dir = try cwd.openDir(io, zvc_root, .{ .iterate = true });
+    defer zvc_dir.close(io);
+    try zvc_dir.createDirPath(io, downloads_subdir);
+    try zvc_dir.createDirPath(io, versions_subdir);
+    var downloads_dir = try zvc_dir.openDir(io, downloads_subdir, .{ .iterate = true });
+    defer downloads_dir.close(io);
+
+    const active_version = try readPointerFile(gpa, io, zvc_dir, active_file);
+    defer if (active_version) |v| gpa.free(v);
+    std.debug.print("Installing zig {s} for {s} (active now: {s})\n", .{
+        version,
+        target_info.triple,
+        active_version orelse "none",
+    });
+
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    // Already on disk (a re-pin, or the version an update left active):
+    // no network needed.
+    const home = if (try resolveVersionHome(gpa, io, zvc_dir, version)) |existing| existing else //
+        try fetchPinned(gpa, io, &client, zvc_dir, downloads_dir, active_version, version);
+    defer gpa.free(home);
+
+    const zig_rel = try std.fs.path.join(gpa, &.{ home, target_info.exe_name });
+    defer gpa.free(zig_rel);
+    const zig_bin = try cwd.realPathFileAlloc(io, zig_rel, gpa);
+    defer gpa.free(zig_bin);
+
+    if (!try validateAgainstTestProjects(io, zig_bin)) {
+        std.log.err(
+            "Zig {s} failed the test projects; {s} stays active.",
+            .{ version, active_version orelse "nothing" },
+        );
+        return error.CandidateFailedTests;
+    }
+
+    // Point the live zig first, so a failure leaves the old version active
+    // and on disk.
+    const live_dir = try resolveLiveInstallPath(gpa, io, zvc_dir, environ_map);
+    defer gpa.free(live_dir);
+    applyLiveInstall(gpa, io, live_dir, home) catch |err| {
+        std.log.err(
+            "Pointing {s} at {s} failed ({t}); {s} stays active.",
+            .{ live_dir, version, err, active_version orelse "nothing" },
+        );
+        return err;
+    };
+    try promoteVersion(gpa, io, zvc_dir, version, active_version, .pin);
+    std.debug.print(
+        \\Zig {s} is active and pinned; the live zig at {s} points to it.
+        \\A plain `zvc` run leaves it alone; `zvc update` moves to the newest {t} release.
+        \\
+    , .{ version, live_dir, channel });
+}
+
+fn fetchPinned(
+    gpa: Allocator,
+    io: Io,
+    client: *std.http.Client,
+    zvc_dir: Dir,
+    downloads_dir: Dir,
+    active_version: ?[]const u8,
+    version: []const u8,
+) ![]u8 {
+    const release = try resolvePinnedRelease(gpa, client, version);
+    defer release.deinit(gpa);
+
+    // Same disk cap as an update: keeps the active version (and whatever
+    // backs the live zig) beside this one and prunes the rest.
+    return prepareVersion(
+        gpa,
+        io,
+        client,
+        zvc_dir,
+        downloads_dir,
+        active_version,
+        &release,
+    ) catch |err| {
+        if (err == error.VersionNotOnServer) std.log.err(
+            \\Zig {s} for {s} is no longer on ziglang.org: dev builds are removed
+            \\from /builds/ some time after they are superseded. Pick a version listed
+            \\in {s}, or move the project's minimum_zig_version forward.
+        , .{ version, target_info.triple, index_url });
+        return err;
+    };
+}
+
+const MinisignError = error{
+    BadSignatureFile,
+    BadPublicKey,
+    KeyIdMismatch,
+    UnsupportedAlgorithm,
+    SignatureMismatch,
+    WrongFile,
+};
+
+fn decodeBase64Exact(comptime len: usize, text: []const u8) ?[len]u8 {
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(text) catch return null;
+    if (size != len) return null;
+    var out: [len]u8 = undefined;
+    decoder.decode(&out, text) catch return null;
+    return out;
+}
+
+/// Checks a minisign signature in the prehashed ("ED") form ziglang.org uses,
+/// over a file whose BLAKE2b-512 digest is `file_digest`. Also requires the
+/// signed trusted comment to name `file_name`, so a validly signed but
+/// different build cannot stand in for the one asked for.
+fn verifyMinisign(
+    sig_file: []const u8,
+    public_key: []const u8,
+    file_digest: *const [64]u8,
+    file_name: []const u8,
+) MinisignError!void {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const untrusted_prefix = "untrusted comment: ";
+    const trusted_prefix = "trusted comment: ";
+
+    var lines = std.mem.splitScalar(u8, sig_file, '\n');
+    var line: [4][]const u8 = undefined;
+    for (&line) |*l| l.* = std.mem.trimEnd(u8, lines.next() orelse
+        return error.BadSignatureFile, "\r");
+    if (!std.mem.startsWith(u8, line[0], untrusted_prefix)) return error.BadSignatureFile;
+    if (!std.mem.startsWith(u8, line[2], trusted_prefix)) return error.BadSignatureFile;
+    const trusted = line[2][trusted_prefix.len..];
+
+    const pk = decodeBase64Exact(42, public_key) orelse return error.BadPublicKey;
+    if (!std.mem.eql(u8, pk[0..2], "Ed")) return error.BadPublicKey;
+    const sig = decodeBase64Exact(74, line[1]) orelse return error.BadSignatureFile;
+    if (!std.mem.eql(u8, sig[0..2], "ED")) return error.UnsupportedAlgorithm;
+    if (!std.mem.eql(u8, sig[2..10], pk[2..10])) return error.KeyIdMismatch;
+    const global = decodeBase64Exact(64, line[3]) orelse return error.BadSignatureFile;
+
+    const key = Ed25519.PublicKey.fromBytes(pk[10..42].*) catch return error.BadPublicKey;
+    Ed25519.Signature.fromBytes(sig[10..74].*).verify(file_digest, key) catch
+        return error.SignatureMismatch;
+
+    var verifier = Ed25519.Signature.fromBytes(global).verifier(key) catch
+        return error.SignatureMismatch;
+    verifier.update(sig[10..74]);
+    verifier.update(trusted);
+    verifier.verify() catch return error.SignatureMismatch;
+
+    var fields = std.mem.splitScalar(u8, trusted, '\t');
+    while (fields.next()) |field| {
+        if (std.mem.startsWith(u8, field, "file:") and
+            std.mem.eql(u8, field["file:".len..], file_name)) return;
+    }
+    return error.WrongFile;
+}
+
+test "parseVersion accepts release and dev versions" {
+    try std.testing.expectEqualStrings("0.16.0", try parseVersion("0.16.0"));
+    try std.testing.expectEqualStrings(
+        "0.18.0-dev.1005+75d48dfff",
+        try parseVersion(" 0.18.0-dev.1005+75d48dfff\r\n"),
+    );
+}
+
+test "parseVersion rejects non-versions and path tricks" {
+    const bad = [_][]const u8{
+        "",
+        "master",
+        "0.16",
+        "latest",
+        "../0.16.0",
+        "0.16.0/../x",
+        "0.16.0\\x",
+        "0.16.0 x",
+        "0.16.0-dev.1+abc:def",
+        "0.16.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    for (bad) |text| try std.testing.expectError(error.InvalidVersion, parseVersion(text));
+}
+
+test "direct URLs: dev builds under /builds, releases under /download" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { triple: []const u8, version: []const u8, ext: []const u8, url: []const u8 }{
+        .{
+            .triple = "x86_64-windows",
+            .version = "0.18.0-dev.1005+75d48dfff",
+            .ext = "zip",
+            .url = "https://ziglang.org/builds/zig-x86_64-windows-0.18.0-dev.1005+75d48dfff.zip",
+        },
+        .{
+            .triple = "aarch64-windows",
+            .version = "0.18.0-dev.1005+75d48dfff",
+            .ext = "zip",
+            .url = "https://ziglang.org/builds/zig-aarch64-windows-0.18.0-dev.1005+75d48dfff.zip",
+        },
+        .{
+            .triple = "x86_64-linux",
+            .version = "0.18.0-dev.1005+75d48dfff",
+            .ext = "tar.xz",
+            .url = "https://ziglang.org/builds/zig-x86_64-linux-0.18.0-dev.1005+75d48dfff.tar.xz",
+        },
+        .{
+            .triple = "aarch64-macos",
+            .version = "0.16.0",
+            .ext = "tar.xz",
+            .url = "https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz",
+        },
+    };
+    for (cases) |case| {
+        const url = try directTarballUrl(gpa, case.triple, case.version, case.ext);
+        defer gpa.free(url);
+        try std.testing.expectEqualStrings(case.url, url);
+    }
+}
+
+test "this build's target names its archive the way ziglang.org does" {
+    const gpa = std.testing.allocator;
+    const name = try archiveFileName(gpa, target_info.triple, "0.16.0", archive_ext);
+    defer gpa.free(name);
+    const expected = "zig-" ++ @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++
+        "-0.16.0." ++ (if (builtin.os.tag == .windows) "zip" else "tar.xz");
+    try std.testing.expectEqualStrings(expected, name);
+}
+
+test "findInIndex: releases by key, the newest dev build via master, older dev builds absent" {
+    const gpa = std.testing.allocator;
+    const index =
+        \\{
+        \\  "master": {
+        \\    "version": "0.18.0-dev.1124+2ecf4b5e2",
+        \\    "x86_64-windows": {
+        \\      "tarball": "https://ziglang.org/builds/zig-x86_64-windows-0.18.0-dev.1124+2ecf4b5e2.zip",
+        \\      "shasum": "aa"
+        \\    }
+        \\  },
+        \\  "0.16.0": {
+        \\    "x86_64-windows": {
+        \\      "tarball": "https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip",
+        \\      "shasum": "bb"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, index, .{});
+    defer parsed.deinit();
+
+    const release = (try findInIndex(gpa, parsed.value, "x86_64-windows", "0.16.0")).?;
+    defer release.deinit(gpa);
+    try std.testing.expectEqualStrings("bb", release.sha_sum.?);
+
+    const master = (try findInIndex(gpa, parsed.value, "x86_64-windows", "0.18.0-dev.1124+2ecf4b5e2")).?;
+    defer master.deinit(gpa);
+    try std.testing.expectEqualStrings("0.18.0-dev.1124+2ecf4b5e2", master.name);
+    try std.testing.expectEqualStrings("aa", master.sha_sum.?);
+
+    try std.testing.expect(null == try findInIndex(gpa, parsed.value, "x86_64-windows", "0.18.0-dev.1005+75d48dfff"));
+    try std.testing.expectError(
+        error.NoBuildForThisTarget,
+        findInIndex(gpa, parsed.value, "aarch64-windows", "0.16.0"),
+    );
+}
+
+test "parseMinimumZigVersion reads a full build.zig.zon and ignores the rest" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\.{
+        \\    .name = .app,
+        \\    .version = "0.0.0",
+        \\    .fingerprint = 0x9d5e988cabe0c3c0,
+        \\    .minimum_zig_version = "0.18.0-dev.1005+75d48dfff",
+        \\    .dependencies = .{
+        \\        .sibling = .{ .path = "../sibling" },
+        \\        .other = .{ .url = "https://example.invalid/x.tar.gz", .hash = "abc", .lazy = true },
+        \\    },
+        \\    .paths = .{ "build.zig", "build.zig.zon", "src" },
+        \\}
+    ;
+    const version = try parseMinimumZigVersion(gpa, source);
+    defer gpa.free(version);
+    try std.testing.expectEqualStrings("0.18.0-dev.1005+75d48dfff", version);
+}
+
+test "parseMinimumZigVersion errors" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(
+        error.NoMinimumZigVersion,
+        parseMinimumZigVersion(gpa, ".{ .name = .x, .version = \"0.0.0\" }"),
+    );
+    try std.testing.expectError(
+        error.InvalidVersion,
+        parseMinimumZigVersion(gpa, ".{ .minimum_zig_version = \"../../evil\" }"),
+    );
+    try std.testing.expectError(error.InvalidBuildZon, parseMinimumZigVersion(gpa, "not zon"));
+}
+
+/// Builds minisign files the way the minisign tool does, from a fixed test key.
+const TestSigner = struct {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const encoder = std.base64.standard.Encoder;
+
+    key_pair: Ed25519.KeyPair,
+    key_id: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 },
+
+    fn init() !TestSigner {
+        return .{ .key_pair = try .generateDeterministic(@splat(7)) };
+    }
+
+    fn publicKey(self: TestSigner, buf: *[56]u8) []const u8 {
+        var raw: [42]u8 = undefined;
+        raw[0..2].* = "Ed".*;
+        raw[2..10].* = self.key_id;
+        raw[10..42].* = self.key_pair.public_key.toBytes();
+        return encoder.encode(buf, &raw);
+    }
+
+    fn signatureFile(
+        self: TestSigner,
+        buf: []u8,
+        alg: *const [2]u8,
+        digest: []const u8,
+        trusted: []const u8,
+    ) ![]const u8 {
+        const sig = (try self.key_pair.sign(digest, null)).toBytes();
+        var raw: [74]u8 = undefined;
+        raw[0..2].* = alg.*;
+        raw[2..10].* = self.key_id;
+        raw[10..74].* = sig;
+        var global_msg: [64 + 256]u8 = undefined;
+        global_msg[0..64].* = sig;
+        @memcpy(global_msg[64..][0..trusted.len], trusted);
+        const global = (try self.key_pair.sign(global_msg[0 .. 64 + trusted.len], null)).toBytes();
+        var raw_b64: [100]u8 = undefined;
+        var global_b64: [88]u8 = undefined;
+        return std.fmt.bufPrint(buf, "untrusted comment: test key\n{s}\ntrusted comment: {s}\n{s}\n", .{
+            encoder.encode(&raw_b64, &raw),
+            trusted,
+            encoder.encode(&global_b64, &global),
+        });
+    }
+};
+
+test "verifyMinisign accepts a good signature and rejects tampering" {
+    const signer = try TestSigner.init();
+    var pk_buf: [56]u8 = undefined;
+    const pk = signer.publicKey(&pk_buf);
+
+    var digest: [64]u8 = undefined;
+    std.crypto.hash.blake2.Blake2b512.hash("archive bytes", &digest, .{});
+    const name = "zig-x86_64-windows-0.18.0-dev.1005+75d48dfff.zip";
+    const trusted = "timestamp:1700000000\tfile:" ++ name ++ "\thashed";
+
+    var buf: [512]u8 = undefined;
+    const good = try signer.signatureFile(&buf, "ED", &digest, trusted);
+    try verifyMinisign(good, pk, &digest, name);
+
+    // A different file.
+    var other: [64]u8 = digest;
+    other[0] ^= 1;
+    try std.testing.expectError(error.SignatureMismatch, verifyMinisign(good, pk, &other, name));
+
+    // A validly signed archive for another version.
+    try std.testing.expectError(
+        error.WrongFile,
+        verifyMinisign(good, pk, &digest, "zig-x86_64-windows-0.16.0.zip"),
+    );
+
+    // An edited trusted comment.
+    var edited_buf: [512]u8 = undefined;
+    const edited = edited_buf[0..good.len];
+    @memcpy(edited, good);
+    const at = std.mem.indexOf(u8, edited, "1700000000").?;
+    edited[at] = '2';
+    try std.testing.expectError(error.SignatureMismatch, verifyMinisign(edited, pk, &digest, name));
+
+    // The legacy, non-prehashed form.
+    var legacy_buf: [512]u8 = undefined;
+    const legacy = try signer.signatureFile(&legacy_buf, "Ed", &digest, trusted);
+    try std.testing.expectError(error.UnsupportedAlgorithm, verifyMinisign(legacy, pk, &digest, name));
+
+    // Another key.
+    var other_signer = try TestSigner.init();
+    other_signer.key_id = .{ 9, 9, 9, 9, 9, 9, 9, 9 };
+    var other_pk_buf: [56]u8 = undefined;
+    const other_pk = other_signer.publicKey(&other_pk_buf);
+    try std.testing.expectError(error.KeyIdMismatch, verifyMinisign(good, other_pk, &digest, name));
+
+    try std.testing.expectError(error.BadSignatureFile, verifyMinisign("junk", pk, &digest, name));
+}
+
+test "verifyMinisign accepts a real ziglang.org signature with the built-in key" {
+    // zig-x86_64-windows-0.18.0-dev.1005+75d48dfff.zip.minisig as served by
+    // ziglang.org, and the BLAKE2b-512 of that zip.
+    const sig_file = "untrusted comment: signature from minisign secret key\n" ++
+        "RUSGOq2NVecA2Q2FZXWo6dZh2r9ZtL5makiXyR21NBkhTnyf872sRb3doHMERNTb78M/ufvl+0ZWdY5xuG3XI2UYnspRjgXh4A8=\n" ++
+        "trusted comment: timestamp:1794397335\tfile:zig-x86_64-windows-0.18.0-dev.1005+75d48dfff.zip\thashed\n" ++
+        "uUxLs9akVtHmb+3c4fsHPrWCSahNa+Vn/Cuy44um1NYMNDjPrNBcmGhcAGHWfGFjwlFbIG23DUQyQlE0umPVCQ==\n";
+    var digest: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &digest,
+        "96eaa95ea7fc6b39ae563374b81509d7d481c62ffb27aa379bea36c26f4e629e" ++
+            "7d86279cc1c0fbb5e6990ad2b6b750bb1dab558a2e395c7cd9ac1e80b35e7e70",
+    );
+    const name = "zig-x86_64-windows-0.18.0-dev.1005+75d48dfff.zip";
+    try verifyMinisign(sig_file, zig_minisign_key, &digest, name);
+    digest[63] ^= 1;
+    try std.testing.expectError(
+        error.SignatureMismatch,
+        verifyMinisign(sig_file, zig_minisign_key, &digest, name),
+    );
+}
+
+test "the built-in Zig key decodes as a minisign Ed25519 key" {
+    const pk = decodeBase64Exact(42, zig_minisign_key).?;
+    try std.testing.expectEqualStrings("Ed", pk[0..2]);
+    _ = try std.crypto.sign.Ed25519.PublicKey.fromBytes(pk[10..42].*);
 }
