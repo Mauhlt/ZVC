@@ -16,17 +16,37 @@ zig version
 
 ## Commands
 Run these from the ZVC repo root: ZVC keeps its state in `.zvc/` under the
-current directory (`zig-out/bin/ZVC.exe` on Windows, `zig-out/bin/ZVC` elsewhere).
+current directory. A prebuilt binary is `zvc-<arch>-<os>[.exe]`; one built from
+source is `zig-out/bin/ZVC[.exe]`.
 
 | Command | What it does |
 | --- | --- |
-| `ZVC` (or `zig build run`) | Update to the newest release of the default channel, unless a version is pinned |
-| `ZVC install <version>` | Download, verify, activate and pin that exact version, e.g. `ZVC install 0.18.0-dev.1005+75d48dfff` |
-| `ZVC install --from <project>` | The same, for the `minimum_zig_version` in `<project>/build.zig.zon` (a path to a `.zon` file works too) |
-| `ZVC update` | Update to the newest release even when pinned, and clear the pin once it is promoted |
-| `ZVC reset` | Wipe versions and downloads, re-seed latest stable + master, promote nothing, clear the pin |
+| `zvc` (or `zig build run`) | Update to the newest nightly, keep the newest stable beside it, and drop any pin. On a machine with no Zig, install the known-good Zig instead and stop |
+| `zvc update` | The same update, but on a machine with no Zig it goes straight to the newest nightly |
+| `zvc install <version>` | Download, verify, activate and pin that exact version, e.g. `zvc install 0.18.0-dev.1005+75d48dfff` |
+| `zvc install --from <project>` | The same, for the `minimum_zig_version` in `<project>/build.zig.zon` (a path to a `.zon` file works too) |
+| `zvc install --known-good <ZVC repo>` | The same, for the version in that repo's `src/known-good-zig.txt` |
+| `zvc version` | Print the known-good Zig compiled into this ZVC |
+| `zvc reset` | Wipe versions and downloads, re-seed latest stable + master, promote nothing, clear the pin |
 
 With `zig build run`, pass arguments after `--`: `zig build run -- install --from ../Portal`.
+
+**A plain `zvc` run moves off a pin.** Don't run plain `zvc` (or `zvc update`)
+on a device that must stay on a pinned version; re-pin with `zvc install --from`
+if you do.
+
+### Known-good Zig
+`src/known-good-zig.txt` holds the Zig version ZVC was last built and tested
+with, and every ZVC binary embeds it. When ZVC promotes a version (an update or an
+install) whose test projects pass, and it is running from its repo, it runs
+`zig build test` on ZVC with the new compiler; if that passes, it writes the
+version to `src/known-good-zig.txt`. Commit that change: pushing it to main is
+what triggers a release.
+
+On a machine with no live Zig and no `zig` on PATH, a plain `zvc` run installs
+exactly that version and makes it live. If ziglang.org no longer has it, ZVC says
+so and installs nothing; then choose explicitly with `zvc update` or
+`zvc install <version>`.
 
 ### Where `install` finds a version
 1. `ziglang.org/download/index.json`: every tagged release, plus the newest dev
@@ -42,44 +62,75 @@ With `zig build run`, pass arguments after `--`: `zig build run -- install --fro
 
 A version already in `.zvc/versions/` is activated without any network access.
 
-### Pinning and updates
-- `install` writes `.zvc/active-version.txt` and `.zvc/pinned-version.txt`, points
-  the live zig at the new version, then removes the previous active version's
-  directory. If the download, check or live-dir update fails, the previous
-  version stays active and on disk.
-- The 2-directory cap still applies: while installing, ZVC keeps the active
-  version (and whatever the live zig points at) and prunes any other directory.
-  The pinned version is the active one, so the cap never removes it.
-- A plain `ZVC` run with a pin set prints the pin and exits without touching the
-  network or disk, so a scheduled or habitual run will not move a project off the
-  version it needs.
-- `ZVC update` is the normal update with the pin overridden: it fetches the newest
-  release, promotes it as usual (removing the pinned directory) and clears the pin.
-  If the new version fails its test projects, the pinned version stays active.
-- Downloads in `.zvc/downloads/` are kept, so re-pinning after an update re-verifies
-  the cached archive instead of downloading it again.
+### Which versions stay on disk
+ZVC keeps two slots, the **newest stable** and the **newest nightly** in
+`.zvc/versions/`, plus the **pinned** version and the **active** one. Usually
+the active version is the nightly or the pin, so at rest that is 2 folders, or 3
+while a pin is set that is neither the newest stable nor the newest nightly. A
+pin never evicts the stable or the nightly.
+
+- An update downloads a newer nightly into the nightly slot (and a newer stable
+  into the stable slot); the slot's old version goes once it is no longer active.
+- While a new version is prepared, the outgoing active version stays until the new
+  one is live, so there can briefly be one folder more.
+- The folder the live zig points at is never deleted.
+- `.zvc/downloads/` keeps only the archives of the versions on disk and of the pin.
+
+### Promotion
+Updates and installs promote the same way: point the live zig at the new
+version first, then write `.zvc/active-version.txt` (and set or clear
+`.zvc/pinned-version.txt`), then prune folders and downloads. If pointing the
+live zig fails, the previous version stays active and on disk.
 
 ## New device
-1. Clone ZVC, and next to it the project that needs a specific Zig (e.g. Portal).
-2. Download any recent Zig from https://ziglang.org/download/ into a temporary
-   folder and do not put it on PATH; ZVC replaces a zig it finds on PATH with a
-   link to the version it manages. If the newest build no longer compiles ZVC,
-   download the version the project pins instead, e.g.
-   `https://ziglang.org/builds/zig-<arch>-<os>-0.18.0-dev.1005+75d48dfff.<zip|tar.xz>`.
-3. Build ZVC with it, from the ZVC folder:
-   ```terminal
-   <temp folder>\zig.exe build
-   ```
-4. Install the project's Zig:
-   ```terminal
-   zig-out\bin\ZVC.exe install --from ..\Portal
-   ```
+Download the prebuilt ZVC for the machine from the latest release
+(`<repo>` is this repository's GitHub URL):
+
+| Machine | Download |
+| --- | --- |
+| Windows x86_64 | `<repo>/releases/latest/download/zvc-x86_64-windows.exe` |
+| Windows on ARM (aarch64) | `<repo>/releases/latest/download/zvc-aarch64-windows.exe` |
+| Linux x86_64 | `<repo>/releases/latest/download/zvc-x86_64-linux` |
+| Linux aarch64 | `<repo>/releases/latest/download/zvc-aarch64-linux` |
+| macOS Intel | `<repo>/releases/latest/download/zvc-x86_64-macos` |
+| macOS Apple silicon | `<repo>/releases/latest/download/zvc-aarch64-macos` |
+
+1. Clone ZVC and, next to it, the project that needs a specific Zig (e.g. Portal).
+   Put the downloaded binary in the ZVC folder (on Linux and macOS, `chmod +x` it).
+2. From the ZVC folder, either:
+   - `zvc-x86_64-windows.exe` installs the known-good Zig and makes it live, or
+   - `zvc-x86_64-windows.exe install --from ..\Portal` installs and pins the
+     project's Zig directly.
+
    On first use ZVC asks where the live zig should go (Enter accepts the
    suggestion). Add that folder to PATH, then open a new terminal.
-5. Check with `zig version` and delete the temporary Zig.
+3. Check with `zig version`. Now ZVC can also be built from source: `zig build`.
 
-Supported targets: Windows, Linux and macOS on x86_64 and aarch64 (including
-Windows on ARM laptops). The archive is `.zip` on Windows and `.tar.xz` elsewhere.
+Without a release, build ZVC from source with its known-good Zig (from
+`https://ziglang.org/builds/` or `/download/`, run by full path, not on PATH,
+because ZVC replaces a zig it finds on PATH with a link to the version it manages).
+
+## Release builds
+- `zig build dist` cross-builds stripped ReleaseSafe binaries for the six targets
+  into `zig-out/dist/zvc-<arch>-<os>[.exe]`.
+- `zig build check-dist` builds them and fails if any contains `/home/runner`,
+  `Users\`, `C:\` or `/Users/` (an absolute build path).
+- `zig build check-zig` fails unless the running zig is the known-good version.
+- `zig build release-info` writes the release tag (`v<UTC date>-zig<version>`) and
+  notes to `zig-out/release/`.
+
+`.github/workflows/release.yml` runs these on ubuntu-latest when a push to main
+changes `src/known-good-zig.txt` (or on a manual run). It installs the
+known-good Zig with the previous release's `zvc-x86_64-linux`, runs `check-zig`,
+`test`, `check-dist` and `release-info`, then creates a release marked latest
+with the six binaries. Any failing step means no release.
+
+Because the workflow uses the previous release's ZVC, the first release has to
+be made by hand, once, with the known-good Zig on PATH:
+```terminal
+zig build check-zig test check-dist release-info
+gh release create <tag from zig-out/release/tag.txt> zig-out/dist/* --notes-file zig-out/release/notes.md --latest
+```
 
 ## Core (first pass)
 1. Comptime platform detection:

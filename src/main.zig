@@ -53,6 +53,7 @@ const Subcommands = enum(u64) {
     reset,
     install,
     update,
+    version,
     _,
 };
 
@@ -133,7 +134,7 @@ pub fn main(init: std.process.Init) !void {
     if (args_it.next()) |subcommand| {
         const command = std.meta.stringToEnum(Subcommands, subcommand) orelse { //
             std.log.err(
-                "Unknown subcommand \"{s}\" (expected clean, reset, install, update, or no arg)",
+                "Unknown subcommand \"{s}\" (expected clean, reset, install, update, version, or no arg)",
                 .{subcommand},
             );
             return error.UnknownSubcommand;
@@ -147,16 +148,21 @@ pub fn main(init: std.process.Init) !void {
                 return doInstall(gpa, io, init.environ_map, version);
             },
             .update => return run(io, gpa, init.environ_map, .update),
+            .version => {
+                std.debug.print("ZVC known-good zig: {s}\n", .{known_good_zig});
+                return;
+            },
             _ => return error.Unimplemented,
         }
     }
 
-    try run(io, gpa, init.environ_map, .default);
+    try run(io, gpa, init.environ_map, .plain);
 }
 
-/// `.default` (no subcommand) leaves a pinned version alone; `.update` is the
-/// explicit "move to the newest release" and clears the pin once it promotes.
-const RunMode = enum { default, update };
+/// Both move to the newest release of `channel` and clear any pin. They differ
+/// only on a device with no zig at all: a plain run then installs ZVC's
+/// known-good zig and stops, while `update` goes straight to the newest build.
+const RunMode = enum { plain, update };
 
 fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map, mode: RunMode) !void {
     std.debug.print(
@@ -179,6 +185,14 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map, mode
     var downloads_dir = try zvc_dir.openDir(io, downloads_subdir, .{ .iterate = true });
     defer downloads_dir.close(io);
 
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    if (mode == .plain and !try hasUsableZig(gpa, io, zvc_dir, environ_map)) {
+        try bootstrapKnownGood(gpa, io, &client, zvc_dir, downloads_dir, environ_map);
+        return;
+    }
+
     const active_version = try readPointerFile(gpa, io, zvc_dir, active_file);
     defer if (active_version) |v| gpa.free(v);
 
@@ -186,22 +200,6 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map, mode
         std.debug.print("Current active version: {s}\n", .{curr_version})
     else //
         std.debug.print("No active version recorded yet.\n", .{});
-
-    if (mode == .default) {
-        const pinned = try readPointerFile(gpa, io, zvc_dir, pin_file);
-        defer if (pinned) |p| gpa.free(p);
-        if (pinned) |p| {
-            std.debug.print(
-                \\Pinned to {s} by `zvc install`; not updating.
-                \\Run `zvc update` to move to the newest {t} release and clear the pin.
-                \\
-            , .{ p, channel });
-            return;
-        }
-    }
-
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
 
     std.debug.print(
         "Checking {s} for latest {t} release...\n",
@@ -218,15 +216,17 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map, mode
 
     std.debug.print("Latest {t} release: {s}\n", .{ channel, latest.name });
 
+    // Keep the other channel's newest release on disk too (stable beside the
+    // nightly): it is the fallback when a nightly fails.
+    refreshOtherSlot(gpa, io, &client, zvc_dir, downloads_dir, parsed.value, active_version);
+
+    const live = channel == .nightly;
     const up_to_date = if (active_version) |cur| std.mem.eql(u8, cur, latest.name) //
         else false;
 
-    var candidate_ok: bool = undefined;
-    var candidate_home: []u8 = undefined;
-
     if (up_to_date) {
         std.debug.print("Already up to date.\n", .{});
-        candidate_home = try resolveVersionHome(
+        const home = try resolveVersionHome(
             gpa,
             io,
             zvc_dir,
@@ -243,37 +243,32 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map, mode
                 zvc_dir,
                 downloads_dir,
                 active_version,
+                versionKind(latest.name),
                 &latest,
             );
         };
-        defer gpa.free(candidate_home);
-        candidate_ok = true;
-        // Only `zvc update` gets here with a pin set (a plain run returned
-        // above), and the pinned version is the newest one: drop the pin.
-        clearPin(io, zvc_dir);
-        try finishRun(
-            gpa,
-            io,
-            environ_map,
-            &client,
-            zvc_dir,
-            downloads_dir,
-            parsed.value,
-            &latest,
-            active_version,
-            candidate_ok,
-            candidate_home,
-        );
+        defer gpa.free(home);
+        // Re-point the live zig in case it drifted, and drop any pin.
+        activateVersion(gpa, io, zvc_dir, environ_map, .{
+            .name = latest.name,
+            .home = home,
+            .pin = .unpin,
+            .live = live,
+        }) catch |err| switch (err) {
+            error.LiveInstallFailed => return,
+            else => return err,
+        };
         return;
     }
 
-    candidate_home = try prepareVersion(
+    const candidate_home = try prepareVersion(
         gpa,
         io,
         &client,
         zvc_dir,
         downloads_dir,
         active_version,
+        versionKind(latest.name),
         &latest,
     );
     defer gpa.free(candidate_home);
@@ -285,68 +280,80 @@ fn run(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map, mode
     defer gpa.free(zig_bin);
     std.debug.print("Candidate Compiler: {s}\n", .{zig_bin});
 
-    candidate_ok = try validateAgainstTestProjects(io, zig_bin);
-
-    if (candidate_ok) {
-        try promoteVersion(gpa, io, zvc_dir, latest.name, active_version, .unpin);
-    } else {
-        std.log.info(
-            \\Breaking Change Detected 
-            \\Zig {s} failed testing.
-            \\Previous active version, {s}, left in place.
-            \\New version remains on disk at {s}/{s}/{s} for inspection.
-            \\Manual review required for promotion.
-        , .{
-            latest.name,
-            if (active_version) |version| version else "none",
-            zvc_root,
-            versions_subdir,
-            latest.name,
-        });
+    if (try validateAgainstTestProjects(io, zig_bin)) {
+        activateVersion(gpa, io, zvc_dir, environ_map, .{
+            .name = latest.name,
+            .home = candidate_home,
+            .pin = .unpin,
+            .live = live,
+        }) catch |err| switch (err) {
+            error.LiveInstallFailed => return,
+            else => return err,
+        };
+        recordKnownGood(gpa, io, zig_bin, latest.name);
+        return;
     }
 
-    try finishRun(
+    std.log.info(
+        \\Breaking Change Detected
+        \\Zig {s} failed testing.
+        \\Previous active version, {s}, left in place.
+        \\New version remains on disk at {s}/{s}/{s} for inspection.
+        \\Manual review required for promotion.
+    , .{
+        latest.name,
+        if (active_version) |version| version else "none",
+        zvc_root,
+        versions_subdir,
+        latest.name,
+    });
+    if (!live) return;
+    try syncLiveFallback(
         gpa,
         io,
-        environ_map,
-        &client,
         zvc_dir,
         downloads_dir,
+        environ_map,
+        &client,
         parsed.value,
-        &latest,
+        latest.name,
         active_version,
-        candidate_ok,
-        candidate_home,
     );
 }
 
-fn finishRun(
+/// Makes sure the newest release of the channel ZVC does not follow is on
+/// disk, without promoting it. Best-effort: a failure only warns.
+fn refreshOtherSlot(
     gpa: Allocator,
     io: Io,
-    environ_map: *const std.process.Environ.Map,
     client: *std.http.Client,
     zvc_dir: Dir,
     downloads_dir: Dir,
     index_root: std.json.Value,
-    latest: *const LatestRelease,
-    previous_active: ?[]const u8,
-    candidate_ok: bool,
-    candidate_home: []const u8,
-) !void {
-    if (channel != .nightly) return;
-    try syncLiveInstall(
+    active_version: ?[]const u8,
+) void {
+    const other = switch (channel) {
+        .nightly => LatestRelease.findLatestStable(gpa, index_root),
+        .stable => LatestRelease.findMaster(gpa, index_root),
+    } catch |err| {
+        std.log.warn("Could not find the other channel's newest release: {t}", .{err});
+        return;
+    };
+    defer other.deinit(gpa);
+    const home = prepareVersion(
         gpa,
         io,
+        client,
         zvc_dir,
         downloads_dir,
-        environ_map,
-        client,
-        index_root,
-        candidate_ok,
-        latest.name,
-        candidate_home,
-        previous_active,
-    );
+        active_version,
+        versionKind(other.name),
+        &other,
+    ) catch |err| {
+        std.log.warn("Could not keep {s} on disk: {t}", .{ other.name, err });
+        return;
+    };
+    gpa.free(home);
 }
 
 fn fetchIndexJson(gpa: Allocator, client: *std.http.Client) ![]u8 {
@@ -607,43 +614,40 @@ fn pruneVersions(
     gpa: Allocator,
     io: Io,
     versions_dir: Dir,
-    keep_name: ?[]const u8,
+    retain: Retain,
     live_real_path: ?[]const u8,
 ) !void {
-    var to_delete: std.ArrayList([]u8) = .empty;
+    var names: std.ArrayList([]u8) = .empty;
     defer {
-        for (to_delete.items) |name| gpa.free(name);
-        to_delete.deinit(gpa);
+        for (names.items) |name| gpa.free(name);
+        names.deinit(gpa);
     }
-
     var it = versions_dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
-        if (keep_name) |keep| {
-            if (std.mem.eql(u8, entry.name, keep)) continue;
-        }
+        try names.append(gpa, try gpa.dupe(u8, entry.name));
+    }
+
+    for (names.items) |name| {
+        if (keepVersion(name, names.items, retain)) continue;
         // Never delete whatever directory currently backs the live zig
         // install, even if it isn't the recorded "active" version (the two
         // can drift, e.g. after a failed promotion). Deleting it out from
         // under a running/linked compiler is what corrupts installs.
         if (live_real_path) |live_real| protect: {
-            const candidate_real = versions_dir.realPathFileAlloc(io, entry.name, gpa) catch
+            const candidate_real = versions_dir.realPathFileAlloc(io, name, gpa) catch
                 break :protect;
             defer gpa.free(candidate_real);
             if (pathIsWithin(candidate_real, live_real)) {
                 std.log.info(
                     "Keeping {s}: currently backs the live zig install.",
-                    .{entry.name},
+                    .{name},
                 );
                 continue;
             }
         }
-        try to_delete.append(gpa, try gpa.dupe(u8, entry.name));
-    }
-
-    for (to_delete.items) |name| {
         std.log.info(
-            "Pruning old candidate {s} (keep active + newest candidates)",
+            "Pruning {s} (keep newest stable + newest nightly + pinned + active)",
             .{name},
         );
         versions_dir.deleteTree(io, name) catch |err| {
@@ -658,7 +662,10 @@ fn prepareVersion(
     client: *std.http.Client,
     zvc_dir: Dir,
     downloads_dir: Dir,
-    keep_alongside: ?[]const u8,
+    active: ?[]const u8,
+    /// The slot this release takes (a newer stable or nightly), whose old
+    /// occupant may then go; null for a pin, which takes no slot.
+    replacing: ?Kind,
     release: *const LatestRelease,
 ) ![]u8 {
     if (try resolveVersionHome(gpa, io, zvc_dir, release.name)) |home| return home;
@@ -666,12 +673,14 @@ fn prepareVersion(
     const archive_name = std.fs.path.basenamePosix(release.tarball);
     try ensureArchiveDownloaded(gpa, io, client, downloads_dir, release, archive_name);
 
-    const live_real_path = currentLiveRealPath(gpa, io, zvc_dir);
-    defer if (live_real_path) |p| gpa.free(p);
-
-    var versions_dir = try zvc_dir.openDir(io, versions_subdir, .{ .iterate = true });
-    try pruneVersions(gpa, io, versions_dir, keep_alongside, live_real_path);
-    versions_dir.close(io);
+    const pinned = try readPointerFile(gpa, io, zvc_dir, pin_file);
+    defer if (pinned) |p| gpa.free(p);
+    try pruneVersionsIn(gpa, io, zvc_dir, .{
+        .active = active,
+        .pinned = pinned,
+        .incoming = release.name,
+        .replacing = replacing,
+    });
 
     const version_rel = try std.fs.path.join(gpa, &.{ versions_subdir, release.name });
     defer gpa.free(version_rel);
@@ -682,7 +691,7 @@ fn prepareVersion(
     std.log.info("Extract into {s}/{s}", .{ zvc_root, version_rel });
     try extractArchive(gpa, io, downloads_dir, archive_name, version_dir);
 
-    const home_rel = try findZigHome(gpa, io, versions_dir, version_rel);
+    const home_rel = try findZigHome(gpa, io, version_dir, version_rel);
     defer gpa.free(home_rel);
     return std.fs.path.join(gpa, &.{ zvc_root, home_rel });
 }
@@ -777,24 +786,37 @@ fn validateAgainstTestProjects(io: Io, zig_bin: []const u8) !bool {
     var all_ok = true;
     for (test_projects) |project_path| {
         std.debug.print("Testing candidate against {s}\n", .{project_path});
-        const argv = [_][]const u8{ zig_bin, "build", "test" };
-        var child = std.process.spawn(io, .{
-            .argv = &argv,
-            .cwd = .{ .path = project_path },
-        }) catch |err| {
-            std.debug.print(" could not launch zig in {s}: {t}\n", .{ project_path, err });
-            all_ok = false;
-            continue;
-        };
-        const term = try child.wait(io);
-        if (term.success()) {
-            std.debug.print(" Ok\n", .{});
-        } else {
-            std.debug.print(" Failed: {f}\n", .{term});
-            all_ok = false;
-        }
+        if (!try zigBuildTestPasses(io, zig_bin, project_path)) all_ok = false;
     }
     return all_ok;
+}
+
+/// Runs `<zig_bin> build test` in `project_path` and reports how it went.
+fn zigBuildTestPasses(io: Io, zig_bin: []const u8, project_path: []const u8) !bool {
+    const argv = [_][]const u8{ zig_bin, "build", "test" };
+    var child = std.process.spawn(io, .{
+        .argv = &argv,
+        .cwd = .{ .path = project_path },
+    }) catch |err| {
+        std.debug.print(" could not launch zig in {s}: {t}\n", .{ project_path, err });
+        return false;
+    };
+    const term = try child.wait(io);
+    if (switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    }) {
+        std.debug.print(" Ok\n", .{});
+        return true;
+    }
+    std.debug.print(" Failed: {f}\n", .{term});
+    return false;
+}
+
+fn pathVar(environ_map: *const std.process.Environ.Map) ?[]const u8 {
+    return environ_map.get("PATH") orelse //
+        environ_map.get("Path") orelse //
+        environ_map.get("path");
 }
 
 fn findLiveZigDir(
@@ -802,10 +824,7 @@ fn findLiveZigDir(
     io: Io,
     environ_map: *const std.process.Environ.Map,
 ) !?[]u8 {
-    const path_var = environ_map.get("PATH") orelse //
-        environ_map.get("Path") orelse //
-        environ_map.get("path") orelse //
-        return null;
+    const path_var = pathVar(environ_map) orelse return null;
     var it = std.mem.tokenizeScalar(u8, path_var, std.fs.path.delimiter);
     while (it.next()) |dir_path| {
         const candidate = try std.fs.path.join(gpa, &.{ dir_path, target_info.exe_name });
@@ -841,9 +860,11 @@ fn defaultLiveDirSuggestion(
 ) ![]u8 {
     switch (builtin.os.tag) {
         .windows => {
+            // No drive letter in the binary: release builds are checked for
+            // `C:\` (see tools/check_dist.zig).
             const base = environ_map.get("LOCALAPPDATA") orelse //
                 environ_map.get("USERPROFILE") orelse //
-                return gpa.dupe(u8, "C:\\zvc\\zig");
+                return std.fs.path.join(gpa, &.{ environ_map.get("SystemDrive") orelse "C:", "zvc", "zig" });
             return std.fs.path.join(gpa, &.{ base, "zvc", "zig" });
         },
         else => {
@@ -893,7 +914,7 @@ fn promptForLiveDir(
     std.log.info(
         \\No existing `zig` found on PATH.
         \\No managed install location configured.
-        \\Dir will be created/reused + added to PATH. 
+        \\Dir will be created/reused; add it to PATH yourself.
         \\Contents will point to currently active version.
         \\Press <ENTER> to accept default suggestion or type an abs path.
         \\[{s}]
@@ -1032,11 +1053,11 @@ fn reportLiveInstallFailure(
     candidate_name: []const u8,
     detail: []const u8,
 ) !void {
-    std.log.err("Nightly {s} failed and {s}", .{ candidate_name, detail });
+    std.log.err("Zig {s}: {s}", .{ candidate_name, detail });
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(
         &buf,
-        "nightly {s} failed and {s}",
+        "zig {s}: {s}",
         .{ candidate_name, detail },
     ) catch
         "nightly failed and the failure detail was too long to log";
@@ -1048,7 +1069,9 @@ fn reportLiveInstallFailure(
     };
 }
 
-fn syncLiveInstall(
+/// After a nightly fails its tests: keep the live zig on a working version,
+/// the previous nightly if it is on disk, else the latest stable.
+fn syncLiveFallback(
     gpa: Allocator,
     io: Io,
     zvc_dir: Dir,
@@ -1056,29 +1079,12 @@ fn syncLiveInstall(
     environ_map: *const std.process.Environ.Map,
     client: *std.http.Client,
     index_root: std.json.Value,
-    candidate_ok: bool,
     candidate_name: []const u8,
-    candidate_home: []const u8,
     previous_active: ?[]const u8,
 ) !void {
     const live_dir = try resolveLiveInstallPath(gpa, io, zvc_dir, environ_map);
     defer gpa.free(live_dir);
 
-    if (candidate_ok) {
-        applyLiveInstall(gpa, io, live_dir, candidate_home) catch |err| {
-            var buf: [256]u8 = undefined;
-            const detail = std.fmt.bufPrint(
-                &buf,
-                "passed its tests but updating {s} failed ({t})",
-                .{ live_dir, err },
-            ) catch
-                "passed its tests but updating live install failed";
-            try reportLiveInstallFailure(io, zvc_dir, candidate_name, detail);
-            return;
-        };
-        std.log.info("Live zig at {s} now points to {s}.", .{ live_dir, candidate_name });
-        return;
-    }
     std.log.info(
         "Nightly {s} failed its tests; looking for a fallback for {s}...\n",
         .{ candidate_name, live_dir },
@@ -1123,6 +1129,7 @@ fn syncLiveInstall(
         zvc_dir,
         downloads_dir,
         previous_active,
+        .stable,
         &stable,
     ) catch |err| {
         var buf: [256]u8 = undefined;
@@ -1199,6 +1206,7 @@ fn doReset(gpa: Allocator, io: Io) !void {
         zvc_dir,
         downloads_dir,
         null,
+        .stable,
         &stable,
     );
     gpa.free(stable_home);
@@ -1210,7 +1218,8 @@ fn doReset(gpa: Allocator, io: Io) !void {
         &client,
         zvc_dir,
         downloads_dir,
-        stable.name,
+        null,
+        .nightly,
         &master,
     );
     defer gpa.free(master_home);
@@ -1226,8 +1235,11 @@ fn doReset(gpa: Allocator, io: Io) !void {
 // Pinned installs: `zvc install <version>` and `zvc install --from <project>`.
 //
 // A pin installs one exact version, makes it active and points the live zig
-// at it. A plain `zvc` run then leaves it alone; `zvc update` is the one way
-// back to the newest release, and it clears the pin once that promotes.
+// at it. It stays until a plain `zvc` run or `zvc update` moves to the newest
+// release, which clears the pin.
+//
+// Version folders kept: the newest stable and the newest nightly on disk (the
+// two slots), plus the pinned version and the active one; see `keepVersion`.
 
 /// The Zig Software Foundation's minisign key, as published on
 /// ziglang.org/download. Every archive there has a `<archive>.minisig` beside it.
@@ -1257,37 +1269,273 @@ fn clearPin(io: Io, zvc_dir: Dir) void {
     };
 }
 
-const PinAction = enum { pin, unpin };
+const PinAction = enum { pin, unpin, keep };
 
-/// Records `new_name` as active, sets or clears the pin, then removes the
-/// previous active version's directory, so only the active one stays.
-fn promoteVersion(
+const Activation = struct {
+    name: []const u8,
+    /// The version's zig home, relative to the cwd or absolute.
+    home: []const u8,
+    pin: PinAction,
+    /// False only for a stable-channel update, whose live zig ZVC leaves alone.
+    live: bool = true,
+};
+
+/// The one promotion step, used by updates, installs and the first-run setup.
+/// It points the live zig at the new version first, so a failure leaves the old
+/// version active and on disk; then records it as active and sets or clears
+/// the pin; then prunes version folders and downloads nothing needs any more.
+fn activateVersion(
     gpa: Allocator,
     io: Io,
     zvc_dir: Dir,
-    new_name: []const u8,
-    old_active: ?[]const u8,
-    pin: PinAction,
+    environ_map: *const std.process.Environ.Map,
+    a: Activation,
 ) !void {
-    try zvc_dir.writeFile(io, .{ .sub_path = active_file, .data = new_name });
-    switch (pin) {
-        .pin => try zvc_dir.writeFile(io, .{ .sub_path = pin_file, .data = new_name }),
+    if (a.live) {
+        const live_dir = try resolveLiveInstallPath(gpa, io, zvc_dir, environ_map);
+        defer gpa.free(live_dir);
+        applyLiveInstall(gpa, io, live_dir, a.home) catch |err| {
+            var buf: [512]u8 = undefined;
+            const detail = std.fmt.bufPrint(
+                &buf,
+                "updating the live zig at {s} failed ({t}); the previous version stays active",
+                .{ live_dir, err },
+            ) catch "updating the live zig failed; the previous version stays active";
+            try reportLiveInstallFailure(io, zvc_dir, a.name, detail);
+            return error.LiveInstallFailed;
+        };
+        std.log.info("Live zig at {s} now points to {s}.", .{ live_dir, a.name });
+        if (!dirIsOnPath(environ_map, live_dir)) std.log.warn(
+            "{s} is not on PATH; add it so `zig` runs the live version.",
+            .{live_dir},
+        );
+    }
+
+    try zvc_dir.writeFile(io, .{ .sub_path = active_file, .data = a.name });
+    switch (a.pin) {
+        .pin => try zvc_dir.writeFile(io, .{ .sub_path = pin_file, .data = a.name }),
         .unpin => clearPin(io, zvc_dir),
+        .keep => {},
     }
-    if (old_active) |old| remove: {
-        if (std.mem.eql(u8, old, new_name)) break :remove;
-        // The name comes from a file on disk; never let it walk out of versions/.
-        _ = parseVersion(old) catch {
-            std.log.warn("Not removing old version \"{s}\": not a version name.", .{old});
-            break :remove;
-        };
-        const old_rel = try std.fs.path.join(gpa, &.{ versions_subdir, old });
-        defer gpa.free(old_rel);
-        zvc_dir.deleteTree(io, old_rel) catch |err| {
-            std.log.warn("Failed to remove old version. {s}: {t}\n", .{ old, err });
+
+    const pinned = try readPointerFile(gpa, io, zvc_dir, pin_file);
+    defer if (pinned) |p| gpa.free(p);
+    try pruneVersionsIn(gpa, io, zvc_dir, .{ .active = a.name, .pinned = pinned });
+    pruneDownloads(gpa, io, zvc_dir) catch |err| {
+        std.log.warn("Could not prune {s}/{s}: {t}", .{ zvc_root, downloads_subdir, err });
+    };
+    std.log.info("Promoted zig version: {s} to active.\n", .{a.name});
+}
+
+fn pruneVersionsIn(gpa: Allocator, io: Io, zvc_dir: Dir, retain: Retain) !void {
+    const live_real_path = currentLiveRealPath(gpa, io, zvc_dir);
+    defer if (live_real_path) |p| gpa.free(p);
+    var versions_dir = try zvc_dir.openDir(io, versions_subdir, .{ .iterate = true });
+    defer versions_dir.close(io);
+    try pruneVersions(gpa, io, versions_dir, retain, live_real_path);
+}
+
+const Kind = enum { stable, nightly };
+
+fn versionKind(name: []const u8) Kind {
+    return if (isNightlyVersionName(name)) .nightly else .stable;
+}
+
+const Retain = struct {
+    active: ?[]const u8 = null,
+    pinned: ?[]const u8 = null,
+    /// The version being prepared.
+    incoming: ?[]const u8 = null,
+    /// Set while a newer stable or nightly is prepared: that slot's old
+    /// occupant is then no longer protected (unless active or pinned).
+    replacing: ?Kind = null,
+};
+
+/// Whether the version folder `name` stays. ZVC keeps two slots, the newest
+/// stable and the newest nightly among `on_disk`, plus the pinned version, the
+/// active one and the one being prepared. So at rest there are at most 2
+/// folders, or 3 with a pin that is neither of the two.
+fn keepVersion(name: []const u8, on_disk: []const []const u8, r: Retain) bool {
+    for ([_]?[]const u8{ r.active, r.pinned, r.incoming }) |protected| {
+        if (protected) |p| if (std.mem.eql(u8, p, name)) return true;
+    }
+    const version = std.SemanticVersion.parse(name) catch return false;
+    const kind = versionKind(name);
+    if (r.replacing) |slot| if (slot == kind) return false;
+    for (on_disk) |other| {
+        if (versionKind(other) != kind) continue;
+        const other_version = std.SemanticVersion.parse(other) catch continue;
+        if (other_version.order(version) == .gt) return false;
+    }
+    return true;
+}
+
+/// Deletes downloaded archives except those of a version folder still on
+/// disk and of the pinned version.
+fn pruneDownloads(gpa: Allocator, io: Io, zvc_dir: Dir) !void {
+    var keep: std.ArrayList([]u8) = .empty;
+    defer {
+        for (keep.items) |name| gpa.free(name);
+        keep.deinit(gpa);
+    }
+    {
+        var versions_dir = try zvc_dir.openDir(io, versions_subdir, .{ .iterate = true });
+        defer versions_dir.close(io);
+        var it = versions_dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            try keep.append(gpa, try gpa.dupe(u8, entry.name));
+        }
+    }
+    if (try readPointerFile(gpa, io, zvc_dir, pin_file)) |pinned| {
+        errdefer gpa.free(pinned);
+        try keep.append(gpa, pinned);
+    }
+
+    var downloads_dir = zvc_dir.openDir(io, downloads_subdir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer downloads_dir.close(io);
+    var doomed: std.ArrayList([]u8) = .empty;
+    defer {
+        for (doomed.items) |name| gpa.free(name);
+        doomed.deinit(gpa);
+    }
+    var it = downloads_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (downloadIsKept(entry.name, keep.items)) continue;
+        try doomed.append(gpa, try gpa.dupe(u8, entry.name));
+    }
+    for (doomed.items) |name| {
+        std.log.info("Pruning old download {s}", .{name});
+        downloads_dir.deleteFile(io, name) catch |err| {
+            std.log.warn("Could not remove {s}: {t}", .{ name, err });
         };
     }
-    std.log.info("Promoted zig version: {s} to active.\n", .{new_name});
+}
+
+/// True if `file_name` is the archive of one of `versions`
+/// (`zig-<target>-<version>.zip` or `.tar.xz`).
+fn downloadIsKept(file_name: []const u8, versions: []const []const u8) bool {
+    for (versions) |version| {
+        for ([_][]const u8{ ".zip", ".tar.xz" }) |ext| {
+            if (!std.mem.endsWith(u8, file_name, ext)) continue;
+            const stem = file_name[0 .. file_name.len - ext.len];
+            if (stem.len <= version.len or !std.mem.endsWith(u8, stem, version)) continue;
+            if (stem[stem.len - version.len - 1] == '-') return true;
+        }
+    }
+    return false;
+}
+
+fn dirIsOnPath(environ_map: *const std.process.Environ.Map, dir_path: []const u8) bool {
+    const path_var = pathVar(environ_map) orelse return false;
+    const want = std.mem.trimEnd(u8, dir_path, "/\\");
+    var it = std.mem.tokenizeScalar(u8, path_var, std.fs.path.delimiter);
+    while (it.next()) |entry| {
+        const have = std.mem.trimEnd(u8, entry, "/\\");
+        const same = if (builtin.os.tag == .windows)
+            std.ascii.eqlIgnoreCase(have, want)
+        else
+            std.mem.eql(u8, have, want);
+        if (same) return true;
+    }
+    return false;
+}
+
+/// The Zig version ZVC was last built and tested with. It is compiled in, so
+/// a prebuilt ZVC can set up a machine with no Zig at all.
+const known_good_zig = std.mem.trim(u8, @embedFile("known-good-zig.txt"), " \t\r\n");
+/// The same record in the repo, relative to the ZVC repo root (the cwd).
+const known_good_path = "src" ++ std.fs.path.sep_str ++ "known-good-zig.txt";
+
+/// True if a live zig is set up or a zig is on PATH.
+fn hasUsableZig(
+    gpa: Allocator,
+    io: Io,
+    zvc_dir: Dir,
+    environ_map: *const std.process.Environ.Map,
+) !bool {
+    if (try loadLiveDirConfig(gpa, io, zvc_dir)) |live| {
+        defer gpa.free(live);
+        if (Dir.cwd().openDir(io, live, .{})) |opened| {
+            var dir = opened;
+            defer dir.close(io);
+            if (looksLikeZigInstallDir(io, dir)) return true;
+        } else |_| {}
+    }
+    if (try findLiveZigDir(gpa, io, environ_map)) |found| {
+        gpa.free(found);
+        return true;
+    }
+    return false;
+}
+
+/// First run on a device with no zig: install exactly the known-good version
+/// and make it live. If that build is gone from ziglang.org, say so and stop;
+/// another version is only ever installed by an explicit command.
+fn bootstrapKnownGood(
+    gpa: Allocator,
+    io: Io,
+    client: *std.http.Client,
+    zvc_dir: Dir,
+    downloads_dir: Dir,
+    environ_map: *const std.process.Environ.Map,
+) !void {
+    std.debug.print(
+        "No zig found (no live install, none on PATH); installing ZVC's known-good zig {s}.\n",
+        .{known_good_zig},
+    );
+    const active_version = try readPointerFile(gpa, io, zvc_dir, active_file);
+    defer if (active_version) |v| gpa.free(v);
+
+    const home = if (try resolveVersionHome(gpa, io, zvc_dir, known_good_zig)) |existing| existing else //
+        fetchPinned(gpa, io, client, zvc_dir, downloads_dir, active_version, known_good_zig) catch |err| {
+            if (err == error.VersionNotOnServer) std.log.err(
+                \\ZVC's known-good zig {s} is no longer on ziglang.org, so nothing was installed.
+                \\Choose a version explicitly: `ZVC update` installs the newest {t} build,
+                \\`ZVC install <version>` a specific one (e.g. the latest stable listed in {s}).
+            , .{ known_good_zig, channel, index_url });
+            return err;
+        };
+    defer gpa.free(home);
+
+    try activateVersion(gpa, io, zvc_dir, environ_map, .{
+        .name = known_good_zig,
+        .home = home,
+        .pin = .keep,
+    });
+    std.debug.print(
+        \\Zig {s} is live. Run `ZVC install --from <project>` to pin a project's version,
+        \\or `ZVC update` to move to the newest {t} build.
+        \\
+    , .{ known_good_zig, channel });
+}
+
+/// After a promotion that passed its test projects: when ZVC runs from its
+/// repo (the record file is in the cwd) and the new zig also builds and tests
+/// ZVC, write it to the repo's known-good record for the owner to commit.
+fn recordKnownGood(gpa: Allocator, io: Io, zig_bin: []const u8, name: []const u8) void {
+    const cwd = Dir.cwd();
+    const current = (readPointerFile(gpa, io, cwd, known_good_path) catch return) orelse return;
+    defer gpa.free(current);
+    if (std.mem.eql(u8, current, name)) return;
+
+    std.debug.print("Checking that zig {s} builds and tests ZVC itself...\n", .{name});
+    const ok = zigBuildTestPasses(io, zig_bin, ".") catch false;
+    if (!ok) {
+        std.log.warn("Zig {s} does not build/test ZVC; {s} stays at {s}.", .{ name, known_good_path, current });
+        return;
+    }
+    var buf: [128]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "{s}\n", .{name}) catch return;
+    cwd.writeFile(io, .{ .sub_path = known_good_path, .data = data }) catch |err| {
+        std.log.warn("Could not update {s}: {t}", .{ known_good_path, err });
+        return;
+    };
+    std.log.info("Recorded zig {s} as ZVC's known-good version in {s}; commit it.", .{ name, known_good_path });
 }
 
 /// Validates a Zig version such as `0.16.0` or `0.18.0-dev.1005+75d48dfff`.
@@ -1388,9 +1636,11 @@ fn resolvePinnedRelease(
     };
 }
 
-/// `zvc install <version>` or `zvc install --from <project dir | build.zig.zon>`.
+/// `zvc install <version>`, `zvc install --from <project dir | build.zig.zon>`,
+/// or `zvc install --known-good <ZVC repo dir>` (the version in its
+/// src/known-good-zig.txt, which may be newer than the one compiled in).
 fn installArgs(gpa: Allocator, io: Io, args_it: *std.process.Args.Iterator) ![]u8 {
-    const usage = "Usage: zvc install <version> | zvc install --from <project dir>";
+    const usage = "Usage: zvc install <version> | --from <project dir> | --known-good <ZVC repo dir>";
     const first = args_it.next() orelse {
         std.log.err("{s}", .{usage});
         return error.MissingVersion;
@@ -1401,6 +1651,12 @@ fn installArgs(gpa: Allocator, io: Io, args_it: *std.process.Args.Iterator) ![]u
             return error.MissingProjectPath;
         };
         break :from try readProjectZigVersion(gpa, io, project);
+    } else if (std.mem.eql(u8, first, "--known-good")) known_good: {
+        const repo = args_it.next() orelse {
+            std.log.err("{s}", .{usage});
+            return error.MissingProjectPath;
+        };
+        break :known_good try readRepoKnownGood(gpa, io, repo);
     } else try gpa.dupe(u8, parseVersion(first) catch |err| {
         std.log.err(
             "\"{s}\" is not a Zig version (e.g. 0.16.0 or 0.18.0-dev.1005+75d48dfff).",
@@ -1441,6 +1697,22 @@ fn readProjectZigVersion(gpa: Allocator, io: Io, project_path: []const u8) ![]u8
         return err;
     };
     std.debug.print("{s} asks for zig {s}\n", .{ zon_path, version });
+    return version;
+}
+
+fn readRepoKnownGood(gpa: Allocator, io: Io, repo_path: []const u8) ![]u8 {
+    var repo = Dir.cwd().openDir(io, repo_path, .{}) catch |err| {
+        std.log.err("Could not open {s}: {t}", .{ repo_path, err });
+        return err;
+    };
+    defer repo.close(io);
+    const raw = (try readPointerFile(gpa, io, repo, known_good_path)) orelse {
+        std.log.err("{s} has no {s}.", .{ repo_path, known_good_path });
+        return error.NoKnownGoodRecord;
+    };
+    defer gpa.free(raw);
+    const version = try gpa.dupe(u8, try parseVersion(raw));
+    std.debug.print("{s} records known-good zig {s}\n", .{ repo_path, version });
     return version;
 }
 
@@ -1494,7 +1766,14 @@ fn doInstall(
     // Already on disk (a re-pin, or the version an update left active):
     // no network needed.
     const home = if (try resolveVersionHome(gpa, io, zvc_dir, version)) |existing| existing else //
-        try fetchPinned(gpa, io, &client, zvc_dir, downloads_dir, active_version, version);
+        fetchPinned(gpa, io, &client, zvc_dir, downloads_dir, active_version, version) catch |err| {
+            if (err == error.VersionNotOnServer) std.log.err(
+                \\Zig {s} for {s} is no longer on ziglang.org: dev builds are removed
+                \\from /builds/ some time after they are superseded. Pick a version listed
+                \\in {s}, or move the project's minimum_zig_version forward.
+            , .{ version, target_info.triple, index_url });
+            return err;
+        };
     defer gpa.free(home);
 
     const zig_rel = try std.fs.path.join(gpa, &.{ home, target_info.exe_name });
@@ -1510,23 +1789,17 @@ fn doInstall(
         return error.CandidateFailedTests;
     }
 
-    // Point the live zig first, so a failure leaves the old version active
-    // and on disk.
-    const live_dir = try resolveLiveInstallPath(gpa, io, zvc_dir, environ_map);
-    defer gpa.free(live_dir);
-    applyLiveInstall(gpa, io, live_dir, home) catch |err| {
-        std.log.err(
-            "Pointing {s} at {s} failed ({t}); {s} stays active.",
-            .{ live_dir, version, err, active_version orelse "nothing" },
-        );
-        return err;
-    };
-    try promoteVersion(gpa, io, zvc_dir, version, active_version, .pin);
+    try activateVersion(gpa, io, zvc_dir, environ_map, .{
+        .name = version,
+        .home = home,
+        .pin = .pin,
+    });
+    recordKnownGood(gpa, io, zig_bin, version);
     std.debug.print(
-        \\Zig {s} is active and pinned; the live zig at {s} points to it.
-        \\A plain `zvc` run leaves it alone; `zvc update` moves to the newest {t} release.
+        \\Zig {s} is active and pinned.
+        \\A plain `zvc` run or `zvc update` moves to the newest {t} release and drops the pin.
         \\
-    , .{ version, live_dir, channel });
+    , .{ version, channel });
 }
 
 fn fetchPinned(
@@ -1541,8 +1814,7 @@ fn fetchPinned(
     const release = try resolvePinnedRelease(gpa, client, version);
     defer release.deinit(gpa);
 
-    // Same disk cap as an update: keeps the active version (and whatever
-    // backs the live zig) beside this one and prunes the rest.
+    // A pin takes no slot: the newest stable and nightly stay beside it.
     return prepareVersion(
         gpa,
         io,
@@ -1550,15 +1822,9 @@ fn fetchPinned(
         zvc_dir,
         downloads_dir,
         active_version,
+        null,
         &release,
-    ) catch |err| {
-        if (err == error.VersionNotOnServer) std.log.err(
-            \\Zig {s} for {s} is no longer on ziglang.org: dev builds are removed
-            \\from /builds/ some time after they are superseded. Pick a version listed
-            \\in {s}, or move the project's minimum_zig_version forward.
-        , .{ version, target_info.triple, index_url });
-        return err;
-    };
+    );
 }
 
 const MinisignError = error{
@@ -1879,6 +2145,97 @@ test "verifyMinisign accepts a real ziglang.org signature with the built-in key"
         error.SignatureMismatch,
         verifyMinisign(sig_file, zig_minisign_key, &digest, name),
     );
+}
+
+test "keepVersion: two slots, plus the pin and the active version" {
+    const disk = [_][]const u8{
+        "0.16.0",
+        "0.17.1",
+        "0.18.0-dev.900+aaaaaaaaa",
+        "0.18.0-dev.1005+75d48dfff",
+        "0.18.0-dev.1124+2ecf4b5e2",
+        "junk",
+    };
+    const pin = "0.18.0-dev.1005+75d48dfff";
+
+    // At rest with a pin: newest stable, newest nightly, the pin.
+    const at_rest: Retain = .{ .active = pin, .pinned = pin };
+    const expect_rest = [_]bool{ false, true, false, true, true, false };
+    for (disk, expect_rest) |name, keep| try std.testing.expectEqual(keep, keepVersion(name, &disk, at_rest));
+
+    // Without a pin, the nightly active: just the two slots.
+    const plain: Retain = .{ .active = "0.18.0-dev.1124+2ecf4b5e2" };
+    const expect_plain = [_]bool{ false, true, false, false, true, false };
+    for (disk, expect_plain) |name, keep| try std.testing.expectEqual(keep, keepVersion(name, &disk, plain));
+
+    // Preparing a newer nightly frees the nightly slot, but not the pin.
+    const next_nightly: Retain = .{
+        .active = pin,
+        .pinned = pin,
+        .incoming = "0.18.0-dev.1200+bbbbbbbbb",
+        .replacing = .nightly,
+    };
+    const expect_next = [_]bool{ false, true, false, true, false, false };
+    for (disk, expect_next) |name, keep| try std.testing.expectEqual(keep, keepVersion(name, &disk, next_nightly));
+
+    // Installing a pin evicts neither slot.
+    const new_pin: Retain = .{ .active = pin, .pinned = pin, .incoming = "0.15.2" };
+    try std.testing.expect(keepVersion("0.17.1", &disk, new_pin));
+    try std.testing.expect(keepVersion("0.18.0-dev.1124+2ecf4b5e2", &disk, new_pin));
+}
+
+test "downloadIsKept matches whole versions only" {
+    const keep = [_][]const u8{ "0.18.0-dev.1005+75d48dfff", "1.0.0" };
+    try std.testing.expect(downloadIsKept("zig-x86_64-windows-0.18.0-dev.1005+75d48dfff.zip", &keep));
+    try std.testing.expect(downloadIsKept("zig-aarch64-macos-1.0.0.tar.xz", &keep));
+    try std.testing.expect(!downloadIsKept("zig-x86_64-linux-11.0.0.tar.xz", &keep));
+    try std.testing.expect(!downloadIsKept("zig-x86_64-windows-0.18.0-dev.1124+2ecf4b5e2.zip", &keep));
+    try std.testing.expect(!downloadIsKept("1.0.0.zip", &keep));
+    try std.testing.expect(!downloadIsKept("zig-x86_64-windows-1.0.0.zip.minisig", &keep));
+}
+
+test "pruneVersions and pruneDownloads on a scratch zvc folder" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const zvc_dir = tmp.dir;
+
+    const versions = [_][]const u8{ "0.17.0", "0.17.1", "0.18.0-dev.1005+75d48dfff", "0.18.0-dev.1124+2ecf4b5e2" };
+    for (versions) |v| {
+        const rel = try std.fs.path.join(gpa, &.{ versions_subdir, v, "lib" });
+        defer gpa.free(rel);
+        try zvc_dir.createDirPath(io, rel);
+        const zip = try std.fmt.allocPrint(gpa, "zig-x86_64-windows-{s}.zip", .{v});
+        defer gpa.free(zip);
+        const zip_rel = try std.fs.path.join(gpa, &.{ downloads_subdir, zip });
+        defer gpa.free(zip_rel);
+        try zvc_dir.createDirPath(io, downloads_subdir);
+        try zvc_dir.writeFile(io, .{ .sub_path = zip_rel, .data = "x" });
+    }
+    try zvc_dir.writeFile(io, .{ .sub_path = downloads_subdir ++ "/zig-x86_64-windows-0.16.0.zip", .data = "x" });
+    try zvc_dir.writeFile(io, .{ .sub_path = pin_file, .data = "0.18.0-dev.1005+75d48dfff\n" });
+
+    try pruneVersionsIn(gpa, io, zvc_dir, .{ .active = "0.18.0-dev.1124+2ecf4b5e2", .pinned = "0.18.0-dev.1005+75d48dfff" });
+    try pruneDownloads(gpa, io, zvc_dir);
+
+    var versions_dir = try zvc_dir.openDir(io, versions_subdir, .{});
+    defer versions_dir.close(io);
+    var downloads_dir = try zvc_dir.openDir(io, downloads_subdir, .{});
+    defer downloads_dir.close(io);
+    for (versions, [_]bool{ false, true, true, true }) |v, kept| {
+        const exists = if (versions_dir.access(io, v, .{})) |_| true else |_| false;
+        try std.testing.expectEqual(kept, exists);
+        const zip = try std.fmt.allocPrint(gpa, "zig-x86_64-windows-{s}.zip", .{v});
+        defer gpa.free(zip);
+        const zip_exists = if (downloads_dir.access(io, zip, .{})) |_| true else |_| false;
+        try std.testing.expectEqual(kept, zip_exists);
+    }
+    try std.testing.expectError(error.FileNotFound, downloads_dir.access(io, "zig-x86_64-windows-0.16.0.zip", .{}));
+}
+
+test "the known-good record is a valid version" {
+    _ = try parseVersion(known_good_zig);
 }
 
 test "the built-in Zig key decodes as a minisign Ed25519 key" {
